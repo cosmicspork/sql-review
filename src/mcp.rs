@@ -1,0 +1,461 @@
+//! The `query` and `describe` tools, served over MCP.
+//!
+//! One handler serves both modes. Standalone (`sql-review mcp`), settings
+//! come from the environment and `.env`, read again on each call. As a
+//! Tracon plugin (`sql-review serve`), every call must pass the caller
+//! context checks first, and its settings come only from the credentials
+//! lent to that call.
+
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use rmcp::{
+    ErrorData, RoleServer, ServerHandler,
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    },
+    service::RequestContext,
+};
+use serde_json::{Map, Value, json};
+
+use crate::{
+    config::{self, CredentialSource, DEFAULT_PROFILE, EnvSource, Resolve},
+    contract::{Caller, Verifier},
+    run::{self, Request},
+    value::{Param, Params},
+};
+
+pub const QUERY: &str = "query";
+pub const DESCRIBE: &str = "describe";
+
+/// The credential a plugin call reads with: `sql-read` for the default
+/// profile, `sql-read-<profile>` for another.
+pub const READ_CREDENTIAL: &str = "sql-read";
+
+/// Where a call's settings come from.
+#[derive(Clone)]
+pub enum Mode {
+    Standalone(Standalone),
+    Plugin(Arc<Verifier>),
+}
+
+#[derive(Clone)]
+pub struct Standalone {
+    pub env: BTreeMap<String, String>,
+    pub cwd: PathBuf,
+    pub env_file: Option<PathBuf>,
+    pub read_only: bool,
+    /// The profiles offered, fixed at start.
+    pub profiles: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct Handler {
+    mode: Mode,
+}
+
+impl Handler {
+    pub fn new(mode: Mode) -> Self {
+        Self { mode }
+    }
+
+    fn profiles(&self) -> Option<&[String]> {
+        match &self.mode {
+            Mode::Standalone(s) => Some(&s.profiles),
+            Mode::Plugin(_) => None,
+        }
+    }
+
+    /// Settings for one call, from the environment or from its credentials.
+    fn config_for(
+        &self,
+        profile: Option<&str>,
+        credentials: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Result<config::Config, String> {
+        match &self.mode {
+            Mode::Standalone(s) => {
+                let chosen = if s.profiles.is_empty() {
+                    profile.map(str::to_string)
+                } else {
+                    Some(select_profile(profile, &s.profiles)?)
+                };
+                let src = EnvSource::load(s.env.clone(), s.env_file.as_deref(), &s.cwd)
+                    .map_err(|e| e.to_string())?;
+                config::resolve(
+                    &src,
+                    Resolve {
+                        profile: chosen.as_deref(),
+                        prefixed: true,
+                        read_only: s.read_only,
+                        env_path: src.path.clone(),
+                    },
+                )
+                .map_err(|e| e.to_string())
+            }
+            Mode::Plugin(_) => {
+                let lent = lent_profiles(credentials);
+                let chosen = match profile {
+                    Some(p) if !lent.iter().any(|x| x == p) => {
+                        return Err(format!(
+                            "credential {} was not lent to this call",
+                            credential_name(p)
+                        ));
+                    }
+                    _ if lent.is_empty() => {
+                        return Err(format!(
+                            "no {READ_CREDENTIAL} credential was lent to this call"
+                        ));
+                    }
+                    _ => select_profile(profile, &lent)?,
+                };
+                let fields = credentials[&credential_name(&chosen)].clone();
+                // Plugin calls never read a write account.
+                config::resolve(
+                    &CredentialSource(fields),
+                    Resolve {
+                        profile: Some(&chosen),
+                        prefixed: false,
+                        read_only: true,
+                        env_path: None,
+                    },
+                )
+                .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    async fn call(
+        &self,
+        tool: &str,
+        args: &Map<String, Value>,
+        credentials: &BTreeMap<String, BTreeMap<String, String>>,
+        _caller: Option<&Caller>,
+    ) -> Result<String, String> {
+        let profile = match args.get("profile") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return Err("profile must be a string".into()),
+        };
+        let cfg = self.config_for(profile, credentials)?;
+        let result = match tool {
+            QUERY => {
+                let sql = args
+                    .get("sql")
+                    .and_then(Value::as_str)
+                    .ok_or("query needs sql")?;
+                let mut params = Params::new();
+                match args.get("params") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Object(m)) => {
+                        for (k, v) in m {
+                            params.insert(k.clone(), Param::from_json(v)?);
+                        }
+                    }
+                    Some(_) => return Err("params must be an object".into()),
+                }
+                let limit = match args.get("limit") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_u64()
+                            .ok_or("limit must be a whole number, 0 or more")?,
+                    ),
+                };
+                run::query(
+                    &cfg,
+                    &Request {
+                        sql: sql.into(),
+                        params,
+                        limit,
+                    },
+                )
+                .await
+            }
+            DESCRIBE => {
+                let table = args
+                    .get("table")
+                    .and_then(Value::as_str)
+                    .ok_or("describe needs a table")?;
+                run::describe(&cfg, table).await
+            }
+            other => return Err(format!("no tool {other:?}")),
+        };
+        result
+            .map(|rs| rs.to_tool_json())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The profiles a call's credentials lend: `sql-read` is `default`,
+/// `sql-read-<p>` is `<p>`.
+pub fn lent_profiles(credentials: &BTreeMap<String, BTreeMap<String, String>>) -> Vec<String> {
+    let mut out: Vec<String> = credentials
+        .keys()
+        .filter_map(|n| {
+            if n == READ_CREDENTIAL {
+                Some(DEFAULT_PROFILE.to_string())
+            } else {
+                n.strip_prefix("sql-read-")
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn credential_name(profile: &str) -> String {
+    if profile == DEFAULT_PROFILE {
+        READ_CREDENTIAL.to_string()
+    } else {
+        format!("{READ_CREDENTIAL}-{profile}")
+    }
+}
+
+/// The profile a call uses. Naming none means the default, or the only one
+/// there is; with several and no default, the call has to say which.
+pub fn select_profile(profile: Option<&str>, profiles: &[String]) -> Result<String, String> {
+    match profile {
+        Some(p) if profiles.iter().any(|x| x == p) => Ok(p.to_string()),
+        Some(p) => Err(format!(
+            "no profile {p:?}; the profiles are {}",
+            profiles.join(", ")
+        )),
+        None if profiles.iter().any(|x| x == DEFAULT_PROFILE) => Ok(DEFAULT_PROFILE.into()),
+        None if profiles.len() == 1 => Ok(profiles[0].clone()),
+        None => Err(format!("say which profile: {}", profiles.join(", "))),
+    }
+}
+
+/// The tools, with `profile` an enum of `profiles` when given (standalone)
+/// or a free string (plugin: the node knows the channel's profiles).
+pub fn definitions(profiles: Option<&[String]>) -> Vec<Value> {
+    let mut defs = vec![
+        json!({
+            "name": QUERY,
+            "description": "Run a read-only SQL query. Reads only: a statement that writes is \
+                            refused, as is more than one statement. Bind values with :name \
+                            placeholders and pass them in params.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string", "description": "A single read, such as a SELECT or WITH statement." },
+                    "params": {
+                        "type": "object",
+                        "description": "Bind values for :name placeholders: strings, integers, booleans or null. Pass decimals as strings.",
+                    },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum rows; 0 means uncapped. Default: the configured fetch limit." },
+                },
+                "required": ["sql"],
+            },
+            "annotations": { "readOnlyHint": true },
+        }),
+        json!({
+            "name": DESCRIBE,
+            "description": "List the columns of a table, with types and nullability, from the \
+                            database's data dictionary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "table": { "type": "string", "description": "A table name, optionally schema-qualified." } },
+                "required": ["table"],
+            },
+            "annotations": { "readOnlyHint": true },
+        }),
+    ];
+    for d in &mut defs {
+        let schema = match profiles {
+            None => json!({
+                "type": "string",
+                "description": "Which database connection to use. Default: the default profile, or the only one.",
+            }),
+            Some([]) => continue,
+            Some(ps) => json!({
+                "type": "string",
+                "enum": ps,
+                "description": "Which database connection to use.",
+            }),
+        };
+        d["inputSchema"]["properties"]["profile"] = schema;
+        if let Some(ps) = profiles {
+            if ps.len() > 1 && !ps.iter().any(|p| p == DEFAULT_PROFILE) {
+                d["inputSchema"]["required"]
+                    .as_array_mut()
+                    .expect("required is an array")
+                    .push(json!("profile"));
+            }
+            let description = format!(
+                "{} Profiles: {}.",
+                d["description"].as_str().unwrap_or_default(),
+                ps.join(", ")
+            );
+            d["description"] = json!(description);
+        }
+    }
+    defs
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+impl ServerHandler for Handler {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("sql-review", crate::VERSION))
+            .with_instructions(
+                "Read-only SQL. `query` runs one read; `describe` lists a table's columns. \
+                 A statement that writes is refused.",
+            )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let tools = definitions(self.profiles())
+            .into_iter()
+            .map(serde_json::from_value::<Tool>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let tool = request.name.to_string();
+        let args = request.arguments.clone().unwrap_or_default();
+        let (credentials, caller) = match &self.mode {
+            Mode::Standalone(_) => (BTreeMap::new(), None),
+            Mode::Plugin(verifier) => {
+                // The checks run before any tool code, and a refusal is a
+                // protocol error, not a tool result.
+                let meta = context
+                    .meta
+                    .0
+                    .0
+                    .get("tracon")
+                    .or_else(|| request.meta.as_ref().and_then(|m| m.0.0.get("tracon")))
+                    .ok_or_else(|| {
+                        ErrorData::invalid_request(
+                            "this call carries no Tracon caller context",
+                            None,
+                        )
+                    })?;
+                let verified = verifier
+                    .verify(meta, &tool, request.arguments.as_ref(), now_ms())
+                    .map_err(|e| {
+                        eprintln!("sql-review: refused a call to {tool}: {e}");
+                        ErrorData::invalid_request(e.to_string(), Some(json!({"check": e.check()})))
+                    })?;
+                let c = &verified.caller;
+                eprintln!(
+                    "sql-review: {tool} for {} session={} channel={}",
+                    c.kind.as_str(),
+                    c.session.as_deref().unwrap_or("-"),
+                    c.channel
+                );
+                (verified.credentials, Some(verified.caller))
+            }
+        };
+        if tool != QUERY && tool != DESCRIBE {
+            return Err(ErrorData::invalid_params(format!("no tool {tool:?}"), None));
+        }
+        let result = match self.call(&tool, &args, &credentials, caller.as_ref()).await {
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            // An error result, not a protocol error, so the caller can correct itself.
+            Err(e) => CallToolResult::error(vec![ContentBlock::text(e)]),
+        };
+        Ok(result.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ps(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn profile_selection() {
+        let both = ps(&["default", "qa"]);
+        assert_eq!(select_profile(None, &both).unwrap(), "default");
+        assert_eq!(select_profile(Some("qa"), &both).unwrap(), "qa");
+        assert!(
+            select_profile(Some("prd"), &both)
+                .unwrap_err()
+                .contains("no profile \"prd\"")
+        );
+        let one = ps(&["qa"]);
+        assert_eq!(select_profile(None, &one).unwrap(), "qa");
+        let two = ps(&["qa", "tst"]);
+        assert_eq!(
+            select_profile(None, &two).unwrap_err(),
+            "say which profile: qa, tst"
+        );
+    }
+
+    #[test]
+    fn credentials_name_profiles() {
+        let creds: BTreeMap<String, BTreeMap<String, String>> = [
+            "sql-read",
+            "sql-read-qa",
+            "sql-read-",
+            "sql-write",
+            "sql-write-qa",
+            "other",
+        ]
+        .into_iter()
+        .map(|n| (n.to_string(), BTreeMap::new()))
+        .collect();
+        assert_eq!(lent_profiles(&creds), ps(&["default", "qa"]));
+        assert_eq!(credential_name("default"), "sql-read");
+        assert_eq!(credential_name("qa"), "sql-read-qa");
+    }
+
+    #[test]
+    fn profile_is_required_only_when_ambiguous() {
+        let req = |defs: &[Value]| defs[0]["inputSchema"]["required"].clone();
+        assert_eq!(
+            req(&definitions(Some(&ps(&["qa", "tst"])))),
+            json!(["sql", "profile"])
+        );
+        assert_eq!(
+            req(&definitions(Some(&ps(&["default", "qa"])))),
+            json!(["sql"])
+        );
+        let defs = definitions(Some(&ps(&["default", "qa"])));
+        assert_eq!(
+            defs[1]["inputSchema"]["properties"]["profile"]["enum"],
+            json!(["default", "qa"])
+        );
+        assert!(
+            definitions(Some(&[]))[0]["inputSchema"]["properties"]
+                .get("profile")
+                .is_none()
+        );
+        let plugin = definitions(None);
+        assert_eq!(
+            plugin[0]["inputSchema"]["properties"]["profile"]["type"],
+            "string"
+        );
+        assert!(
+            plugin[0]["inputSchema"]["properties"]["profile"]
+                .get("enum")
+                .is_none()
+        );
+    }
+}

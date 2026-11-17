@@ -1,0 +1,31 @@
+# Tracon plugin contract v1. The release archive holds this file and
+# bin/sql-review; Tracon runs `exec` with --socket <path> --data <dir>.
+name = "sql-review"
+version = "0.1.0"
+contract = 1
+exec = ["bin/sql-review", "serve"]
+# The database hosts depend on each deployment's credentials, so none are
+# declared here.
+egress = []
+
+# Read account: `sql-read` is the default profile, `sql-read-<profile>` any
+# other. Fields are the standalone DB_* keys (DB_BACKEND, DB_HOST, DB_PORT,
+# DB_SERVICE, DB_USER, DB_PASSWORD, DATABASE_URL, ...).
+[[credential]]
+name = "sql-read"
+pattern = "sql-read-*"
+
+# Write account, for writes approved through review. Declared now; nothing
+# reads it until proposed writes ship.
+[[credential]]
+name = "sql-write"
+pattern = "sql-write-*"
+lend = "approved"
+
+[[tool]]
+name = "query"
+hint = "read"
+
+[[tool]]
+name = "describe"
+hint = "read"

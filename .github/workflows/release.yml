@@ -1,0 +1,108 @@
+name: release
+
+# A tag v<version> builds the plugin archives the Tracon contract names,
+# <name>-<version>-<target>.tar.gz holding tracon-plugin.toml and
+# bin/sql-review, and publishes them with checksums.txt.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux builds are static musl binaries, named for the contract's
+          # -unknown-linux-gnu targets: the name says which platform, and a
+          # static binary runs on any Linux of that architecture.
+          - runner: ubuntu-24.04
+            build: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
+            zig: true
+          - runner: ubuntu-24.04
+            build: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
+            zig: true
+          - runner: macos-15
+            build: aarch64-apple-darwin
+            target: aarch64-apple-darwin
+            zig: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      BUILD: ${{ matrix.build }}
+      TARGET: ${{ matrix.target }}
+      ZIG: ${{ matrix.zig }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the versions match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(sed -n 's/^version = "\(.*\)"$/\1/p' tracon-plugin.toml)
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$manifest" != "$tag" ] || [ "$crate" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, tracon-plugin.toml $manifest, Cargo.toml $crate"
+            exit 1
+          fi
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target "$BUILD"
+      - if: matrix.zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+      - if: matrix.zig
+        run: cargo install cargo-zigbuild --locked --version 0.24.1
+      - name: Build
+        run: |
+          if [ "$ZIG" = "true" ]; then
+            cargo zigbuild --locked --release --target "$BUILD"
+          else
+            cargo build --locked --release --target "$BUILD"
+          fi
+      - if: matrix.zig
+        name: Check the binary is static
+        run: |
+          file "target/$BUILD/release/sql-review"
+          file "target/$BUILD/release/sql-review" | grep -q 'statically linked'
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p pkg/bin dist
+          cp "target/$BUILD/release/sql-review" pkg/bin/
+          cp tracon-plugin.toml pkg/
+          tar -C pkg -czf "dist/sql-review-$version-$TARGET.tar.gz" tracon-plugin.toml bin
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sql-review-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sql-review-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > checksums.txt && cat checksums.txt
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

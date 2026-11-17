@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # The workflows pin every action to a commit SHA, so nothing moves unless
+  # this does it. One grouped PR a month.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
+  # oracledb is pinned to an exact pre-release in Cargo.toml and left out:
+  # moving that pin is a deliberate change, not a monthly bump.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: deps
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: oracledb
