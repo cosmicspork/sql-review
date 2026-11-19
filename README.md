@@ -192,7 +192,7 @@ A call without `_meta.tracon` is refused. A call that passes has its caller (kin
 
 There is no separate header check of the token: the instance hash inside the signed context carries it.
 
-**Test vectors:** `tests/contract_vectors.json` holds a fixed seed and its public key, one valid context with its signing bytes and signature, and one spoiled context per check with the check that must refuse it. Until jira-review publishes its own file in this shape, this repository's is checked in; Tracon's node can check its signer against either.
+**Test vectors:** `tests/contract_vectors.json` is jira-review's file, copied verbatim, so both plugins and Tracon's node check against the same bytes: a fixed seed and its public key, one valid context with its signing bytes and signature, and refused contexts covering every check, each with the check that must refuse it. Its contexts are addressed to jira-review; the tests build sql-review's verifier for that plugin name. A signed field the vectors don't carry, such as `preview_token`, is covered by the signature and accepted.
 
 ## Checking Oracle
 
@@ -207,7 +207,7 @@ It connects, runs `SELECT 1 FROM DUAL`, runs a query of typed values through eve
 ## What is verified and what isn't
 
 - **SQLite**: verified end to end in the test suite: the CLI (every format, describe, params, limits, profiles, `.env` discovery, `--read-only`, refusals), `mcp` over stdio, and `serve` over a Unix socket with signed contexts and lent credentials, including a write sent past the classifier failing on the read-only connection.
-- **The contract**: verified against this repository's own test vectors and the `serve` tests. The node side is being written in parallel; until it calls this build, the wire format is checked only against itself.
+- **The contract**: verified against jira-review's test vectors (shared with Tracon's node) and the `serve` tests. The node side is being written in parallel; until it calls this build, the wire format is checked only against itself.
 - **SQL Server**: integration tests in `tests/mssql.rs` run only when `SQL_REVIEW_TEST_MSSQL_URL` points at a server; they have not been run yet. The `:name` placeholder rewrite is unit-tested.
 - **Oracle**: built on Oracle's pure-Rust driver (`oracledb`, pinned to `26.0.0-beta.6`) and unit-tested where it can be (connect strings, number mapping), but **unverified against a database** until `check-oracle` is run against one.
 - **Release builds**: both Linux targets have been built locally the way the release workflow builds them (`cargo zigbuild`, zig 0.15.2) and come out statically linked; the x86_64 binary was run, the aarch64 one only built. The `aarch64-apple-darwin` archive is unverified until the first tag builds it.
