@@ -77,6 +77,26 @@ impl ResultSet {
         out
     }
 
+    /// A hash of the rows as a set: sha256 over the column names and each
+    /// row's JSON, rows sorted, so the order a backend returns them in
+    /// doesn't matter.
+    pub fn content_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut rows: Vec<String> = self
+            .rows
+            .iter()
+            .map(|r| Value::from(r.iter().map(Cell::to_json).collect::<Vec<_>>()).to_string())
+            .collect();
+        rows.sort();
+        let mut h = Sha256::new();
+        h.update(Value::from(self.columns.clone()).to_string());
+        for r in rows {
+            h.update(b"\n");
+            h.update(r);
+        }
+        hex::encode(h.finalize())
+    }
+
     /// The shape the MCP tools answer with:
     /// `{"columns":[…],"rows":[{…}],"row_count":n,"truncated":bool}`.
     pub fn to_tool_json(&self) -> String {
@@ -116,5 +136,46 @@ impl Param {
     }
 }
 
+impl Param {
+    pub fn to_json(&self) -> Value {
+        match self {
+            Param::Null => Value::Null,
+            Param::Bool(b) => Value::Bool(*b),
+            Param::Int(i) => Value::from(*i),
+            Param::Float(f) => Value::from(*f),
+            Param::Text(s) => Value::String(s.clone()),
+        }
+    }
+}
+
 /// Named parameters, keyed by placeholder name without the colon.
 pub type Params = BTreeMap<String, Param>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_hash_ignores_row_order_but_not_values() {
+        let rs = |rows: Vec<Vec<Cell>>| ResultSet {
+            columns: vec!["a".into(), "b".into()],
+            rows,
+            truncated: false,
+        };
+        let one = rs(vec![
+            vec![Cell::Int(1), Cell::Text("x".into())],
+            vec![Cell::Int(2), Cell::Null],
+        ]);
+        let swapped = rs(vec![
+            vec![Cell::Int(2), Cell::Null],
+            vec![Cell::Int(1), Cell::Text("x".into())],
+        ]);
+        let changed = rs(vec![
+            vec![Cell::Int(1), Cell::Text("y".into())],
+            vec![Cell::Int(2), Cell::Null],
+        ]);
+        assert_eq!(one.content_hash(), swapped.content_hash());
+        assert_ne!(one.content_hash(), changed.content_hash());
+        assert_ne!(rs(vec![]).content_hash(), one.content_hash());
+    }
+}

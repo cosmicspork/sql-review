@@ -1,13 +1,27 @@
-//! SQLite through rusqlite (bundled). The file is opened read-only and the
-//! connection set to `query_only`, so SQLite itself refuses any write.
+//! SQLite through rusqlite (bundled). For reads the file is opened read-only
+//! and the connection set to `query_only`, so SQLite itself refuses any
+//! write. Proposed writes open it read-write; SQLite has no logins, so the
+//! write account's settings only switch that on.
+//!
+//! SQLite has no row locks. A preview and an apply each start with `BEGIN
+//! IMMEDIATE`, which takes the database's write lock, so nothing else
+//! writes between reading the rows and committing.
 
-use rusqlite::{Connection, OpenFlags, types::ValueRef};
+use std::time::{Duration, Instant};
 
-use super::{DbError, take_limited};
+use rusqlite::{Connection, OpenFlags, Statement, types::ValueRef};
+
+use super::{
+    ApplyFail, DbError, Expected, Previewed, SyncConn, WritePlan, apply_on, preview_on,
+    take_limited,
+};
 use crate::{
     config::Config,
     value::{Cell, Param, Params, ResultSet},
 };
+
+/// How long an apply waits for another writer to finish.
+const APPLY_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn open(cfg: &Config) -> Result<Connection, DbError> {
     let path = cfg.database.as_deref().unwrap_or(":memory:");
@@ -25,6 +39,93 @@ fn open(cfg: &Config) -> Result<Connection, DbError> {
     conn.pragma_update(None, "query_only", "ON")
         .map_err(DbError::connect)?;
     Ok(conn)
+}
+
+fn open_write(cfg: &Config, busy: Duration) -> Result<Connection, DbError> {
+    let path = cfg.database.as_deref().unwrap_or(":memory:");
+    let conn = if path == ":memory:" {
+        Connection::open_in_memory()
+    } else {
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    }
+    .map_err(DbError::connect)?;
+    conn.busy_timeout(busy).map_err(DbError::connect)?;
+    Ok(conn)
+}
+
+impl SyncConn for Connection {
+    fn read(&self, sql: &str, params: &Params) -> Result<ResultSet, DbError> {
+        read_on(self, sql, params, 0)
+    }
+
+    fn execute(&self, sql: &str, params: &Params) -> Result<u64, DbError> {
+        let mut stmt = self.prepare(sql).map_err(DbError::query)?;
+        bind(&mut stmt, params)?;
+        stmt.raw_execute().map(|n| n as u64).map_err(DbError::query)
+    }
+}
+
+pub async fn preview(
+    cfg: &Config,
+    plan: &WritePlan,
+    sample: usize,
+    limit: Duration,
+) -> Result<Option<Previewed>, DbError> {
+    let (cfg, plan) = (cfg.clone(), plan.clone());
+    let deadline = Instant::now() + limit;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut task = tokio::task::spawn_blocking(move || {
+        let conn = open_write(&cfg, limit)?;
+        let _ = tx.send(conn.get_interrupt_handle());
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(DbError::query)?;
+        let out = preview_on(&conn, &plan, sample, deadline);
+        let rolled_back = conn
+            .execute_batch("ROLLBACK")
+            .map_err(|e| DbError(format!("rollback failed: {e}")));
+        let out = out?;
+        rolled_back?;
+        Ok(out)
+    });
+    match tokio::time::timeout(limit, &mut task).await {
+        Ok(joined) => joined
+            .map_err(|e| DbError(format!("the preview task failed: {e}")))?
+            .map(Some),
+        Err(_) => {
+            if let Ok(handle) = rx.try_recv() {
+                handle.interrupt();
+            }
+            let _ = task.await;
+            Ok(None)
+        }
+    }
+}
+
+pub async fn apply(cfg: &Config, plan: &WritePlan, expect: &Expected) -> Result<u64, ApplyFail> {
+    let (cfg, plan, expect) = (cfg.clone(), plan.clone(), expect.clone());
+    tokio::task::spawn_blocking(move || {
+        let conn = open_write(&cfg, APPLY_BUSY_TIMEOUT)?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(DbError::query)?;
+        match apply_on(&conn, &plan, &expect) {
+            Ok(n) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| DbError(format!("commit failed: {e}")))?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    })
+    .await
+    .map_err(|e| DbError(format!("the apply task failed: {e}")))?
 }
 
 pub async fn check(cfg: &Config) -> Result<(), DbError> {
@@ -58,23 +159,7 @@ fn read_on(
     limit: u64,
 ) -> Result<ResultSet, DbError> {
     let mut stmt = conn.prepare(sql).map_err(DbError::query)?;
-    // Bind only the names the statement uses, as consulta's SQLAlchemy did.
-    for (name, value) in params {
-        let Some(index) = stmt
-            .parameter_index(&format!(":{name}"))
-            .map_err(DbError::query)?
-        else {
-            continue;
-        };
-        let bound = match value {
-            Param::Null => stmt.raw_bind_parameter(index, rusqlite::types::Null),
-            Param::Bool(b) => stmt.raw_bind_parameter(index, b),
-            Param::Int(i) => stmt.raw_bind_parameter(index, i),
-            Param::Float(f) => stmt.raw_bind_parameter(index, f),
-            Param::Text(s) => stmt.raw_bind_parameter(index, s),
-        };
-        bound.map_err(DbError::query)?;
-    }
+    bind(&mut stmt, params)?;
     let columns: Vec<String> = stmt.column_names().map(String::from).collect();
     let width = columns.len();
     let mut rows = stmt.raw_query();
@@ -93,6 +178,27 @@ fn read_on(
         rows,
         truncated,
     })
+}
+
+/// Bind only the names the statement uses, as consulta's SQLAlchemy did.
+fn bind(stmt: &mut Statement<'_>, params: &Params) -> Result<(), DbError> {
+    for (name, value) in params {
+        let Some(index) = stmt
+            .parameter_index(&format!(":{name}"))
+            .map_err(DbError::query)?
+        else {
+            continue;
+        };
+        let bound = match value {
+            Param::Null => stmt.raw_bind_parameter(index, rusqlite::types::Null),
+            Param::Bool(b) => stmt.raw_bind_parameter(index, b),
+            Param::Int(i) => stmt.raw_bind_parameter(index, i),
+            Param::Float(f) => stmt.raw_bind_parameter(index, f),
+            Param::Text(s) => stmt.raw_bind_parameter(index, s),
+        };
+        bound.map_err(DbError::query)?;
+    }
+    Ok(())
 }
 
 fn cell(v: ValueRef<'_>) -> Cell {

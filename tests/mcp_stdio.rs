@@ -18,8 +18,13 @@ struct Server {
 
 impl Server {
     fn start(env: &[(&str, String)], cwd: &std::path::Path) -> Self {
+        Self::start_with(&[], env, cwd)
+    }
+
+    fn start_with(args: &[&str], env: &[(&str, String)], cwd: &std::path::Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sql-review"))
             .arg("mcp")
+            .args(args)
             .env_clear()
             .envs(env.iter().map(|(k, v)| (k, v)))
             .current_dir(cwd)
@@ -106,6 +111,10 @@ fn setup() -> (tempfile::TempDir, std::path::PathBuf, Server) {
         ("DB_BACKEND", "sqlite".to_string()),
         ("DB_SERVICE", db.display().to_string()),
         ("QA_DB_SERVICE", qa.display().to_string()),
+        (
+            "SQL_REVIEW_STATE",
+            dir.path().join("state").display().to_string(),
+        ),
     ];
     let server = Server::start(&env, dir.path());
     (dir, db, server)
@@ -117,14 +126,15 @@ fn tools_list_offers_the_profiles() {
     let r = s.request("tools/list", json!({}));
     let tools = r["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["query", "describe"]);
-    for t in tools {
+    assert_eq!(names, ["query", "describe", "write", "proposal_status"]);
+    for t in &tools[..3] {
         assert_eq!(
             t["inputSchema"]["properties"]["profile"]["enum"],
             json!(["default", "qa"])
         );
-        assert_eq!(t["annotations"]["readOnlyHint"], true);
     }
+    assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
+    assert_eq!(tools[2]["annotations"]["readOnlyHint"], false);
 }
 
 #[test]
@@ -179,4 +189,116 @@ fn an_unknown_profile_is_an_error_result() {
         .call("query", json!({"sql": "SELECT 1", "profile": "prd"}))
         .unwrap_err();
     assert!(e.contains("no profile \"prd\""), "{e}");
+}
+
+fn write_env(dir: &std::path::Path, db: &std::path::Path) -> Vec<(&'static str, String)> {
+    vec![
+        ("DB_BACKEND", "sqlite".to_string()),
+        ("DB_SERVICE", db.display().to_string()),
+        ("DB_WRITE_USER", "writer".to_string()),
+        ("DB_WRITE_PASSWORD", "w".to_string()),
+        ("SQL_REVIEW_STATE", dir.join("state").display().to_string()),
+    ]
+}
+
+/// `sql-review review` run beside the server, against the same state.
+fn review(env: &[(&str, String)], cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_sql-review"))
+        .arg("review")
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_write_waits_for_review_in_a_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = common::apps_db(dir.path(), "apps.sqlite");
+    let env = write_env(dir.path(), &db);
+    let mut s = Server::start(&env, dir.path());
+
+    let r = s
+        .call(
+            "write",
+            json!({"sql": "DELETE FROM apps WHERE strm = :s", "params": {"s": "1261"}}),
+        )
+        .unwrap();
+    assert_eq!(r["status"], "pending");
+    assert_eq!(r["row_count"], 2);
+    assert_eq!(r["previewable"], true);
+    assert!(r["preview"].as_str().unwrap().contains("before"), "{r}");
+    let id = r["proposal_id"].as_str().unwrap().to_string();
+    assert_eq!(common::count(&db), 3, "only proposed");
+
+    let pending = s
+        .call("proposal_status", json!({"id": id, "wait_secs": 0}))
+        .unwrap();
+    assert_eq!(pending["status"], "pending");
+
+    let out = review(&env, dir.path(), &["--approve", &id]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let done = s
+        .call("proposal_status", json!({"id": id, "wait_secs": 5}))
+        .unwrap();
+    assert_eq!(done["status"], "approved");
+    assert_eq!(done["row_count"], 2);
+    assert_eq!(common::count(&db), 1);
+
+    let r = s
+        .call(
+            "write",
+            json!({"sql": "ALTER TABLE apps ADD COLUMN x INTEGER"}),
+        )
+        .unwrap();
+    assert_eq!(r["previewable"], false);
+    let id = r["proposal_id"].as_str().unwrap().to_string();
+    let out = review(
+        &env,
+        dir.path(),
+        &["--reject", &id, "--reason", "no DDL today"],
+    );
+    assert!(out.status.success());
+    let done = s.call("proposal_status", json!({"id": id})).unwrap();
+    assert_eq!(done["status"], "rejected");
+    assert_eq!(done["reason"], "no DDL today");
+
+    let e = s.call("write", json!({"sql": "SELECT 1"})).unwrap_err();
+    assert!(e.contains("only reads"), "{e}");
+}
+
+#[test]
+fn read_only_offers_no_write_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = common::apps_db(dir.path(), "apps.sqlite");
+    let mut env = write_env(dir.path(), &db);
+    // No state directory is needed, or made, under --read-only.
+    env.retain(|(k, _)| *k != "SQL_REVIEW_STATE");
+    let mut s = Server::start_with(&["--read-only"], &env, dir.path());
+    let r = s.request("tools/list", json!({}));
+    let names: Vec<&str> = r["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["query", "describe"]);
+    let r = s.request(
+        "tools/call",
+        json!({"name": "write", "arguments": {"sql": "DELETE FROM apps"}}),
+    );
+    assert!(r.get("error").is_some(), "{r}");
+    let e = s
+        .call("query", json!({"sql": "DELETE FROM apps"}))
+        .unwrap_err();
+    assert!(e.contains("writes are disabled (--read-only)"), "{e}");
+    assert_eq!(common::count(&db), 3);
+    assert!(!dir.path().join("state").exists());
 }

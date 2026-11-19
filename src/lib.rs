@@ -6,6 +6,7 @@
 //! account, and the classifier ([`classify`]) only sorts reads from writes.
 
 pub mod backend;
+pub mod change;
 pub mod check_oracle;
 pub mod classify;
 pub mod cli;
@@ -13,8 +14,10 @@ pub mod config;
 pub mod contract;
 pub mod mcp;
 pub mod render;
+pub mod review;
 pub mod run;
 pub mod serve;
+pub mod store;
 pub mod value;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,8 +1,8 @@
 //! Is a statement a read or a write?
 //!
 //! **This is not a security control.** sql-review keeps a parser only to sort
-//! statements: a read runs, a write is refused for now (and becomes a
-//! proposal for review in a later version). Reads always run on the
+//! statements: a read runs, and a write is refused by `query` and can be
+//! proposed for review instead (see [`crate::change`]). Reads always run on the
 //! read-only account, in the backend's read-only mode where it has one, so a
 //! write this misclassifies as a read still runs read-only and fails. The
 //! database account is the boundary, not this module.

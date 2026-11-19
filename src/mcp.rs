@@ -1,16 +1,18 @@
-//! The `query` and `describe` tools, served over MCP.
+//! The `query` and `describe` tools, served over MCP, and standalone, the
+//! `write` and `proposal_status` tools.
 //!
 //! One handler serves both modes. Standalone (`sql-review mcp`), settings
-//! come from the environment and `.env`, read again on each call. As a
-//! Tracon plugin (`sql-review serve`), every call must pass the caller
-//! context checks first, and its settings come only from the credentials
-//! lent to that call.
+//! come from the environment and `.env`, read again on each call, and a
+//! write is proposed into the store for a person to decide with `sql-review
+//! review`. As a Tracon plugin (`sql-review serve`), every call must pass
+//! the caller context checks first, its settings come only from the
+//! credentials lent to that call, and there is no write tool yet.
 
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::{
@@ -24,14 +26,21 @@ use rmcp::{
 use serde_json::{Map, Value, json};
 
 use crate::{
+    change,
     config::{self, CredentialSource, DEFAULT_PROFILE, EnvSource, Resolve},
     contract::{Caller, Verifier},
     run::{self, Request},
+    store::{Place, Store},
     value::{Param, Params},
 };
 
 pub const QUERY: &str = "query";
 pub const DESCRIBE: &str = "describe";
+pub const WRITE: &str = "write";
+pub const PROPOSAL_STATUS: &str = "proposal_status";
+
+/// The longest `proposal_status` waits in one call.
+pub const MAX_WAIT_SECS: u64 = 45;
 
 /// The credential a plugin call reads with: `sql-read` for the default
 /// profile, `sql-read-<profile>` for another.
@@ -52,6 +61,9 @@ pub struct Standalone {
     pub read_only: bool,
     /// The profiles offered, fixed at start.
     pub profiles: Vec<String>,
+    /// Where proposed writes wait for review. `None` under `--read-only`,
+    /// which offers no write tools.
+    pub store: Option<Store>,
 }
 
 #[derive(Clone)]
@@ -62,6 +74,14 @@ pub struct Handler {
 impl Handler {
     pub fn new(mode: Mode) -> Self {
         Self { mode }
+    }
+
+    /// The store writes are proposed into, when this server offers writes.
+    fn store(&self) -> Option<&Store> {
+        match &self.mode {
+            Mode::Standalone(s) if !s.read_only => s.store.as_ref(),
+            _ => None,
+        }
     }
 
     fn profiles(&self) -> Option<&[String]> {
@@ -141,23 +161,38 @@ impl Handler {
             Some(Value::String(s)) => Some(s.as_str()),
             Some(_) => return Err("profile must be a string".into()),
         };
+        if tool == PROPOSAL_STATUS {
+            let store = self.store().ok_or("this server offers no writes")?;
+            return proposal_status(store, args).await.map(|v| v.to_string());
+        }
         let cfg = self.config_for(profile, credentials)?;
+        if tool == WRITE {
+            let store = self.store().ok_or("this server offers no writes")?;
+            let sql = args
+                .get("sql")
+                .and_then(Value::as_str)
+                .ok_or("write needs sql")?;
+            let params = params_of(args)?;
+            let p = change::propose(&cfg, sql, &params).await?;
+            store.put(&p)?;
+            return Ok(json!({
+                "proposal_id": p.id,
+                "status": "pending",
+                "previewable": p.preview.kind != change::PreviewKind::NotPreviewable,
+                "row_count": p.preview.row_count,
+                "preview": change::render(&p),
+                "review": "nothing is written yet: a person approves or rejects this with \
+                           `sql-review review` in a terminal; wait for that with proposal_status",
+            })
+            .to_string());
+        }
         let result = match tool {
             QUERY => {
                 let sql = args
                     .get("sql")
                     .and_then(Value::as_str)
                     .ok_or("query needs sql")?;
-                let mut params = Params::new();
-                match args.get("params") {
-                    None | Some(Value::Null) => {}
-                    Some(Value::Object(m)) => {
-                        for (k, v) in m {
-                            params.insert(k.clone(), Param::from_json(v)?);
-                        }
-                    }
-                    Some(_) => return Err("params must be an object".into()),
-                }
+                let params = params_of(args)?;
                 let limit = match args.get("limit") {
                     None | Some(Value::Null) => None,
                     Some(v) => Some(
@@ -188,6 +223,112 @@ impl Handler {
             .map(|rs| rs.to_tool_json())
             .map_err(|e| e.to_string())
     }
+}
+
+fn params_of(args: &Map<String, Value>) -> Result<Params, String> {
+    let mut params = Params::new();
+    match args.get("params") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(m)) => {
+            for (k, v) in m {
+                params.insert(k.clone(), Param::from_json(v)?);
+            }
+        }
+        Some(_) => return Err("params must be an object".into()),
+    }
+    Ok(params)
+}
+
+/// Wait up to `wait_secs` for a proposal to be decided.
+async fn proposal_status(store: &Store, args: &Map<String, Value>) -> Result<Value, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("proposal_status needs an id")?;
+    let wait = match args.get("wait_secs") {
+        None | Some(Value::Null) => 30,
+        Some(v) => v.as_u64().ok_or("wait_secs must be a whole number")?,
+    }
+    .min(MAX_WAIT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    loop {
+        let found = store.get(id)?;
+        let decided = match &found {
+            None => return Err(format!("no proposal {id}")),
+            Some((Place::Decided, p)) => p.outcome.as_ref(),
+            Some((Place::Pending, _)) => None,
+        };
+        if let Some(o) = decided {
+            let mut v = serde_json::to_value(o).map_err(|e| e.to_string())?;
+            v["id"] = json!(id);
+            return Ok(v);
+        }
+        if Instant::now() >= deadline {
+            // Claimed but not yet written back: someone is applying it.
+            let status = match found {
+                Some((Place::Decided, _)) => "applying",
+                _ => "pending",
+            };
+            return Ok(json!({ "id": id, "status": status }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The standalone write tools, `profile` as [`definitions`] gives it.
+pub fn write_definitions(profiles: &[String]) -> Vec<Value> {
+    let mut write = json!({
+        "name": WRITE,
+        "description": "Propose one write (INSERT, UPDATE, DELETE, MERGE, or DDL) for a person to \
+                        review. Nothing is written yet: the statement is previewed on the write \
+                        account in a transaction that is rolled back, showing the rows it would \
+                        change, and returns a proposal_id. A person approves or rejects it with \
+                        `sql-review review`; wait for that with proposal_status. DDL and procedure \
+                        calls are never run at preview and show as not previewable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sql": { "type": "string", "description": "One write statement." },
+                "params": {
+                    "type": "object",
+                    "description": "Bind values for :name placeholders: strings, integers, booleans or null. Pass decimals as strings.",
+                },
+            },
+            "required": ["sql"],
+        },
+        "annotations": { "readOnlyHint": false, "destructiveHint": true },
+    });
+    // The same profile argument the reads have.
+    if let Some(profile) =
+        definitions(Some(profiles))[0]["inputSchema"]["properties"].get("profile")
+    {
+        write["inputSchema"]["properties"]["profile"] = profile.clone();
+        if profiles.len() > 1 && !profiles.iter().any(|p| p == DEFAULT_PROFILE) {
+            write["inputSchema"]["required"] = json!(["sql", "profile"]);
+        }
+    }
+    vec![
+        write,
+        json!({
+            "name": PROPOSAL_STATUS,
+            "description": format!(
+                "Wait for a proposed write to be decided, up to wait_secs (at most \
+                 {MAX_WAIT_SECS}, 30 unless you say). status is pending while nobody has \
+                 decided; approved with the rows it changed; rejected with the reviewer's \
+                 reason; stale when its rows moved after it was proposed (propose again); \
+                 failed when the database refused it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The proposal_id write returned." },
+                    "wait_secs": { "type": "integer", "minimum": 0 },
+                },
+                "required": ["id"],
+            },
+            "annotations": { "readOnlyHint": true },
+        }),
+    ]
 }
 
 /// The profiles a call's credentials lend: `sql-read` is `default`,
@@ -308,12 +449,17 @@ fn now_ms() -> i64 {
 
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
+        let instructions = if self.store().is_some() {
+            "SQL. `query` runs one read; `describe` lists a table's columns; a write sent to \
+             `query` is refused. `write` proposes a write for a person to review with \
+             `sql-review review`, and `proposal_status` waits for their decision."
+        } else {
+            "Read-only SQL. `query` runs one read; `describe` lists a table's columns. \
+             A statement that writes is refused."
+        };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("sql-review", crate::VERSION))
-            .with_instructions(
-                "Read-only SQL. `query` runs one read; `describe` lists a table's columns. \
-                 A statement that writes is refused.",
-            )
+            .with_instructions(instructions)
     }
 
     async fn list_tools(
@@ -321,7 +467,11 @@ impl ServerHandler for Handler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools = definitions(self.profiles())
+        let mut defs = definitions(self.profiles());
+        if self.store().is_some() {
+            defs.extend(write_definitions(self.profiles().unwrap_or_default()));
+        }
+        let tools = defs
             .into_iter()
             .map(serde_json::from_value::<Tool>)
             .collect::<Result<Vec<_>, _>>()
@@ -369,7 +519,8 @@ impl ServerHandler for Handler {
                 (verified.credentials, Some(verified.caller))
             }
         };
-        if tool != QUERY && tool != DESCRIBE {
+        let writes = self.store().is_some() && (tool == WRITE || tool == PROPOSAL_STATUS);
+        if tool != QUERY && tool != DESCRIBE && !writes {
             return Err(ErrorData::invalid_params(format!("no tool {tool:?}"), None));
         }
         let result = match self.call(&tool, &args, &credentials, caller.as_ref()).await {

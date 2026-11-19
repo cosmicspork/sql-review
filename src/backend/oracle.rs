@@ -3,15 +3,25 @@
 //! The driver is blocking, so each read runs on a blocking thread. A read
 //! opens `SET TRANSACTION READ ONLY`, runs, and always rolls back.
 //!
+//! A proposed write runs on the write account with autocommit off: a
+//! preview rolls back under a call timeout, and an apply locks the rows
+//! `FOR UPDATE` before it runs and commits.
+//!
 //! Built and unit-tested here, but not run against an Oracle database:
-//! `sql-review check-oracle` is how an operator verifies it.
+//! `sql-review check-oracle` is how an operator verifies reads, and nothing
+//! has verified writes yet.
+
+use std::time::{Duration, Instant};
 
 use oracledb::{Connection, Row, ToDbValue};
 
-use super::{DbError, placeholders, take_limited};
+use super::{
+    ApplyFail, DbError, Expected, Previewed, SyncConn, WritePlan, apply_on, placeholders,
+    preview_on, take_limited,
+};
 use crate::{
     classify::Dialect,
-    config::Config,
+    config::{Account, Config},
     value::{Cell, Param, Params, ResultSet},
 };
 
@@ -35,7 +45,10 @@ pub fn connect_string(cfg: &Config) -> String {
 }
 
 pub fn connect(cfg: &Config) -> Result<Connection, DbError> {
-    let account = cfg.account();
+    connect_as(cfg, &cfg.account())
+}
+
+fn connect_as(cfg: &Config, account: &Account) -> Result<Connection, DbError> {
     let config = oracledb::Config::default()
         .set_credentials(
             &account.user,
@@ -44,6 +57,75 @@ pub fn connect(cfg: &Config) -> Result<Connection, DbError> {
         .set_connect_string(&connect_string(cfg))
         .map_err(DbError::connect)?;
     oracledb::connect(config).map_err(DbError::connect)
+}
+
+impl SyncConn for Connection {
+    fn read(&self, sql: &str, params: &Params) -> Result<ResultSet, DbError> {
+        read_on(self, sql, params, 0)
+    }
+
+    fn execute(&self, sql: &str, params: &Params) -> Result<u64, DbError> {
+        let values = named_binds(sql, params)?;
+        let binds: Vec<(&str, &dyn ToDbValue)> =
+            values.iter().map(|(n, v)| (*n, v.as_ref())).collect();
+        self.execute_named(sql, &binds)
+            .map(|r| r.rows_affected())
+            .map_err(DbError::query)
+    }
+}
+
+pub async fn preview(
+    cfg: &Config,
+    account: &Account,
+    plan: &WritePlan,
+    sample: usize,
+    limit: Duration,
+) -> Result<Option<Previewed>, DbError> {
+    let (cfg, account, plan) = (cfg.clone(), account.clone(), plan.clone());
+    blocking(move || {
+        let conn = connect_as(&cfg, &account)?;
+        conn.set_call_timeout(Some(limit))
+            .map_err(DbError::connect)?;
+        let started = Instant::now();
+        let out = preview_on(&conn, &plan, sample, started + limit);
+        let rolled_back = conn
+            .rollback()
+            .map_err(|e| DbError(format!("rollback failed: {e}")));
+        match out {
+            Err(_) if started.elapsed() >= limit => Ok(None),
+            out => {
+                let out = out?;
+                rolled_back?;
+                Ok(Some(out))
+            }
+        }
+    })
+    .await
+}
+
+pub async fn apply(
+    cfg: &Config,
+    account: &Account,
+    plan: &WritePlan,
+    expect: &Expected,
+) -> Result<u64, ApplyFail> {
+    let (cfg, account, plan, expect) = (cfg.clone(), account.clone(), plan.clone(), expect.clone());
+    tokio::task::spawn_blocking(move || {
+        let conn = connect_as(&cfg, &account)?;
+        match apply_on(&conn, &plan, &expect) {
+            Ok(n) => {
+                conn.commit()
+                    .map_err(|e| DbError(format!("commit failed: {e}")))?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.rollback();
+                Err(e)
+            }
+        }
+    })
+    .await
+    .map_err(|e| DbError(format!("the apply task failed: {e}")))?
 }
 
 pub async fn check(cfg: &Config) -> Result<(), DbError> {
@@ -93,17 +175,7 @@ pub fn read_on(
     params: &Params,
     limit: u64,
 ) -> Result<ResultSet, DbError> {
-    // Oracle refuses a bind the statement doesn't name, so bind only the
-    // names it uses. Oracle names are case-insensitive.
-    let used: Vec<String> = placeholders(sql, Dialect::Oracle)?
-        .into_iter()
-        .map(|(_, n)| n.to_ascii_uppercase())
-        .collect();
-    let values: Vec<(&str, Box<dyn ToDbValue>)> = params
-        .iter()
-        .filter(|(name, _)| used.contains(&name.to_ascii_uppercase()))
-        .map(|(name, value)| (name.as_str(), bind(value)))
-        .collect();
+    let values = named_binds(sql, params)?;
     let binds: Vec<(&str, &dyn ToDbValue)> = values.iter().map(|(n, v)| (*n, v.as_ref())).collect();
     let cursor = conn.query_named(sql, &binds).map_err(DbError::query)?;
     let columns: Vec<String> = cursor
@@ -118,6 +190,22 @@ pub fn read_on(
         rows,
         truncated,
     })
+}
+
+type NamedBind<'a> = (&'a str, Box<dyn ToDbValue>);
+
+/// Oracle refuses a bind the statement doesn't name, so bind only the names
+/// it uses. Oracle names are case-insensitive.
+fn named_binds<'a>(sql: &str, params: &'a Params) -> Result<Vec<NamedBind<'a>>, DbError> {
+    let used: Vec<String> = placeholders(sql, Dialect::Oracle)?
+        .into_iter()
+        .map(|(_, n)| n.to_ascii_uppercase())
+        .collect();
+    Ok(params
+        .iter()
+        .filter(|(name, _)| used.contains(&name.to_ascii_uppercase()))
+        .map(|(name, value)| (name.as_str(), bind(value)))
+        .collect())
 }
 
 fn bind(p: &Param) -> Box<dyn ToDbValue> {
