@@ -1,259 +1,516 @@
 {
-  "call": {
-    "arguments": {
-      "limit": 10,
-      "params": {
-        "strm": "1261"
-      },
-      "sql": "SELECT app_id FROM apps WHERE strm = :strm"
-    },
-    "tool": "query"
-  },
-  "description": "Tracon plugin caller context, wire format v1. `replay`: verify the context once before the check. `call` overrides the call a context is checked against. `write_tools`: tools the verifier treats as writes.",
-  "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
+  "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+  "label": "tracon/v1/plugin-call",
+  "note": "Caller-context wire format v1 (provisional; shared by jira-review, sql-review and Tracon's plugin host). seed is the raw ed25519 secret key, used as SigningKey::from_bytes(seed): it is NOT a Tracon Identity seed, which derives its key through HKDF. signing_bytes = ASCII label || u32 big-endian length || canonical JSON of the context without signature (keys sorted by byte order, no whitespace, serde_json escaping, integers only). Each refused case is checked with a fresh nonce cache at now_ms, except the one marked after: valid, which follows the valid context in the same cache.",
   "now_ms": 1794900000000,
-  "plugin": "sql-review",
-  "plugin_token": "plugin-token-for-vectors",
-  "public_key": "0d7550754e0800a5d237eef5826035766b9b3e5a15868a940ab289958788e3b0",
-  "seed": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
-  "tampered": [
+  "plugin_token": "jira-review-test-plugin-token",
+  "public_key": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+  "refused": [
     {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
       "check": 1,
       "context": {
-        "approval_id": null,
-        "arguments_sha256": "f962cd5e3c02047202d92b3acd443c1cbd27b1471966b9ab04847eb2e27600b9",
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
         "caller": {
           "harness": "claude",
           "kind": "agent",
-          "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
         },
         "channel": "personal",
         "credentials": {
-          "sql-read": {
-            "DB_BACKEND": "sqlite",
-            "DB_SERVICE": "apps.sqlite"
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
           }
         },
-        "expires_ms": 1794900030000,
-        "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
-        "issued_ms": 1794900000000,
-        "nonce": "11111111111111111111111111111111",
+        "expires_ms": 1794900029000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0001",
         "plugin": "jira-review",
-        "signature": "37046b15cb3fb89fbd0c70995c3975b36a57ab7af92ddc664c5184cf1ef3bd80d065b394a6275f70073808895542580c1ff5636fb4984576cae421004ca72a08",
-        "tool": "query",
-        "v": 1
+        "signature": "5db9a99b0d55678a4d4186b98bdc232795f47a991e7a7c2c63d8290caeffcde2e33dfb8e45fca506ba397459860ce0e575776d428aae0d3ccf667d4c7a8b5505",
+        "tool": "update",
+        "v": 2
       },
-      "name": "another plugin's context"
-    },
-    {
-      "check": 2,
-      "context": {
-        "approval_id": null,
-        "arguments_sha256": "f962cd5e3c02047202d92b3acd443c1cbd27b1471966b9ab04847eb2e27600b9",
-        "caller": {
-          "harness": "claude",
-          "kind": "agent",
-          "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
-        },
-        "channel": "personal",
-        "credentials": {
-          "sql-read": {
-            "DB_BACKEND": "sqlite",
-            "DB_SERVICE": "apps.sqlite"
-          }
-        },
-        "expires_ms": 1794900030000,
-        "instance": "728a6eebdf2c29c8f6afaad2f06f2e8255aef713e79c0efed09d84ec2fc553f1",
-        "issued_ms": 1794900000000,
-        "nonce": "22222222222222222222222222222222",
-        "plugin": "sql-review",
-        "signature": "1ccd424b4d3f4b7caa31ff01c56c52970cdf82bd0276601bc02c4e1286d37baa5d7e4bdc5aff20f944b1de2c7f4d4cde56697ccd4b0a42c9e0517c5f14208002",
-        "tool": "query",
-        "v": 1
-      },
-      "name": "a previous spawn's instance"
+      "expect": "refused",
+      "name": "wrong v"
     },
     {
       "call": {
         "arguments": {
-          "sql": "SELECT * FROM apps"
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
         },
-        "tool": "query"
+        "tool": "update"
       },
-      "check": 3,
+      "check": 1,
       "context": {
-        "approval_id": null,
-        "arguments_sha256": "f962cd5e3c02047202d92b3acd443c1cbd27b1471966b9ab04847eb2e27600b9",
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
         "caller": {
           "harness": "claude",
           "kind": "agent",
-          "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
         },
         "channel": "personal",
         "credentials": {
-          "sql-read": {
-            "DB_BACKEND": "sqlite",
-            "DB_SERVICE": "apps.sqlite"
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
           }
         },
-        "expires_ms": 1794900030000,
-        "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
-        "issued_ms": 1794900000000,
-        "nonce": "33333333333333333333333333333333",
+        "expires_ms": 1794900029000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0002",
         "plugin": "sql-review",
-        "signature": "3cc26d6b2d66b0d066a997e748c9645130f334dd3031337debb902c711199a2a30ac34fdf165101943dacf373a757a898c1e33e66fa4fa87b1bd22571135420c",
-        "tool": "query",
+        "signature": "98d2b74ec2ae12f36f7fb25e5729ef059dbf626005b2e5368f8c972c65abc9619bfce9602830d85aa1b90a7e104d1f238868d83a8ecf94705717a6455e913309",
+        "tool": "update",
         "v": 1
       },
-      "name": "arguments changed after signing"
-    },
-    {
-      "check": 4,
-      "context": {
-        "approval_id": null,
-        "arguments_sha256": "f962cd5e3c02047202d92b3acd443c1cbd27b1471966b9ab04847eb2e27600b9",
-        "caller": {
-          "harness": "claude",
-          "kind": "agent",
-          "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
-        },
-        "channel": "work",
-        "credentials": {
-          "sql-read": {
-            "DB_BACKEND": "sqlite",
-            "DB_SERVICE": "apps.sqlite"
-          }
-        },
-        "expires_ms": 1794900030000,
-        "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
-        "issued_ms": 1794900000000,
-        "nonce": "44444444444444444444444444444444",
-        "plugin": "sql-review",
-        "signature": "cf7b48c27cf47dfe0b98b0e70f73c8839ede8b03216b7a60ae5c1087860c70763dac5afee41ca797efb7e3cc6d1ced96206ce60767c37aa53c48e7bc5edc6f0a",
-        "tool": "query",
-        "v": 1
-      },
-      "name": "a field changed without re-signing"
-    },
-    {
-      "check": 5,
-      "context": {
-        "approval_id": null,
-        "arguments_sha256": "f962cd5e3c02047202d92b3acd443c1cbd27b1471966b9ab04847eb2e27600b9",
-        "caller": {
-          "harness": "claude",
-          "kind": "agent",
-          "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
-        },
-        "channel": "personal",
-        "credentials": {
-          "sql-read": {
-            "DB_BACKEND": "sqlite",
-            "DB_SERVICE": "apps.sqlite"
-          }
-        },
-        "expires_ms": 1794899910000,
-        "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
-        "issued_ms": 1794899880000,
-        "nonce": "55555555555555555555555555555555",
-        "plugin": "sql-review",
-        "signature": "05d346565e816dce86241c71570056d719172ac077c6542121bbaa6d51a2eb625d939f913ae36bd2a26b9ceee54ed1e033c0afd552f1f4386d1683be8b8a570c",
-        "tool": "query",
-        "v": 1
-      },
-      "name": "expired"
-    },
-    {
-      "check": 6,
-      "context": {
-        "approval_id": null,
-        "arguments_sha256": "f962cd5e3c02047202d92b3acd443c1cbd27b1471966b9ab04847eb2e27600b9",
-        "caller": {
-          "harness": "claude",
-          "kind": "agent",
-          "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
-        },
-        "channel": "personal",
-        "credentials": {
-          "sql-read": {
-            "DB_BACKEND": "sqlite",
-            "DB_SERVICE": "apps.sqlite"
-          }
-        },
-        "expires_ms": 1794900030000,
-        "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
-        "issued_ms": 1794900000000,
-        "nonce": "66666666666666666666666666666666",
-        "plugin": "sql-review",
-        "signature": "85fb243eed17eca05192095b98e9402c537962d7000d48cc6693936a5a7ad85e7a16e378f4b93a07b006e5f61ffe607c2f9554b8d946eb58380c0dc99058580d",
-        "tool": "query",
-        "v": 1
-      },
-      "name": "a replayed nonce",
-      "replay": true
+      "expect": "refused",
+      "name": "wrong plugin"
     },
     {
       "call": {
-        "arguments": {},
-        "tool": "apply"
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
+      "check": 2,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794900029000,
+        "instance": "9e78bcb94091b75109fd6773524fc8d6a4f8a6dfb3dae39a9c26c5001879bcf3",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0003",
+        "plugin": "jira-review",
+        "signature": "5ed1f7a2c0e591b268517fd2e225bf330b3864f1559edf6f5c8f04473b8e6e52edcdd3b111da19d1a33fce5f75c0e91f3010e7d1bc6ca2de9e0cd2e802b1b807",
+        "tool": "update",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "wrong instance"
+    },
+    {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
+      "check": 3,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794900029000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0004",
+        "plugin": "jira-review",
+        "signature": "bc261c5272e3443176855c2bf05767503b05186be018f03633968d1f7b05b994c2331a09c580f790b7a8b73666a10fcfb4e14c8b351a332ba325d7f7a902450a",
+        "tool": "comment",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "wrong tool"
+    },
+    {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship something else"
+        },
+        "tool": "update"
+      },
+      "check": 3,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794900029000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0005",
+        "plugin": "jira-review",
+        "signature": "3acf5e71816bf9aa34b4a9d48c430e3615d37216fb2c11c4470e1c65fc7bfdfb0ab9ac3eb53bad76aeeb4b65d8c43b3ec3b44738421c68ff3bf46404cd11ee08",
+        "tool": "update",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "wrong arguments hash"
+    },
+    {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
+      "check": 4,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794900029000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0006",
+        "plugin": "jira-review",
+        "signature": "275c56abd3b361ae98220593ffd577fea6ec29d0dffe857718be145e8208a5ff1a5603aca4679a46627fa59b8b4ce2fc2658c3f75f9c77e749e1ea083725dc04",
+        "tool": "update",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "bad signature"
+    },
+    {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
+      "check": 5,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794899990000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899930000,
+        "nonce": "0000000000000000000000005eed0007",
+        "plugin": "jira-review",
+        "signature": "8fdeb39e542ef45f3fddefa22be26259ecf71100f63ea3b419a0734a92918f9226753b56f5b1aae617cd71e3536b6cc73e117d0fff8ebba2ec074b0802173a06",
+        "tool": "update",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "expired"
+    },
+    {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
+      "check": 5,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794900040000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794900010000,
+        "nonce": "0000000000000000000000005eed0008",
+        "plugin": "jira-review",
+        "signature": "fad4fb14866d270ad83f9c908eb5538e07cc59775eac52c32634baf1710e8802b92f7277e7198abf47ea5c03e2cfdfba661803bc375111e4f360697345ae6b03",
+        "tool": "update",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "issued too far ahead"
+    },
+    {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
+      "check": 5,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794900060000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0009",
+        "plugin": "jira-review",
+        "signature": "32f79cafb32389cd4bb192c39b5afb18f215707468ed8736617cc6758418a3a7237fbbf621a3f50aca925a8e6568ab9792bfefab9e2d8317354d999a2794ad0f",
+        "tool": "update",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "window over 60 s"
+    },
+    {
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
       },
       "check": 7,
       "context": {
         "approval_id": null,
-        "arguments_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
         "caller": {
           "harness": "claude",
           "kind": "agent",
-          "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
         },
         "channel": "personal",
         "credentials": {
-          "sql-read": {
-            "DB_BACKEND": "sqlite",
-            "DB_SERVICE": "apps.sqlite"
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
           }
         },
-        "expires_ms": 1794900030000,
-        "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
-        "issued_ms": 1794900000000,
-        "nonce": "77777777777777777777777777777777",
-        "plugin": "sql-review",
-        "signature": "368c1345d1b2678c6dbf0af0aa9f60d1e2c538ce80cbf44b943f461b7a20e0965c6da30f0d193cf6dfb8c7decf8d46897d9586268c9f7fe5c8058c62a9538e00",
-        "tool": "apply",
+        "expires_ms": 1794900029000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed000a",
+        "plugin": "jira-review",
+        "signature": "b6fb966323e6f8c54e3333adc43ed350e45c5db77c8401643bf08c0ea9c4642ea14cc9a58959bcf56c3e35019a60948f80dabce2d16023fcb0257788bc94a007",
+        "tool": "update",
         "v": 1
       },
-      "name": "a write tool without an approval"
+      "expect": "refused",
+      "name": "write without approval_id"
+    },
+    {
+      "after": "valid",
+      "call": {
+        "arguments": {
+          "key": "WRK-1",
+          "labels": [
+            "a",
+            "b"
+          ],
+          "profile": "work",
+          "summary": "Ship it"
+        },
+        "tool": "update"
+      },
+      "check": 6,
+      "context": {
+        "approval_id": "apv-0001",
+        "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
+        "caller": {
+          "harness": "claude",
+          "kind": "agent",
+          "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
+        },
+        "channel": "personal",
+        "credentials": {
+          "jira-work": {
+            "JIRA_EMAIL": "me@example.com",
+            "JIRA_TOKEN": "not-a-real-token",
+            "JIRA_URL": "https://example.atlassian.net"
+          }
+        },
+        "expires_ms": 1794900029000,
+        "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+        "issued_ms": 1794899999000,
+        "nonce": "0000000000000000000000005eed0000",
+        "plugin": "jira-review",
+        "signature": "e167dba19431571b95e9cdbd9d4e640760bedbf1b134ccaa60bca0b15ef78babc7de6c6b306d090b0a254ccefeeaf4c0663a71171c92d457bd83b9f40e30dd01",
+        "tool": "update",
+        "v": 1
+      },
+      "expect": "refused",
+      "name": "replayed nonce"
     }
   ],
+  "seed": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
   "valid": {
+    "arguments_canonical": "{\"key\":\"WRK-1\",\"labels\":[\"a\",\"b\"],\"profile\":\"work\",\"summary\":\"Ship it\"}",
+    "call": {
+      "arguments": {
+        "key": "WRK-1",
+        "labels": [
+          "a",
+          "b"
+        ],
+        "profile": "work",
+        "summary": "Ship it"
+      },
+      "tool": "update"
+    },
     "context": {
-      "approval_id": null,
-      "arguments_sha256": "f962cd5e3c02047202d92b3acd443c1cbd27b1471966b9ab04847eb2e27600b9",
+      "approval_id": "apv-0001",
+      "arguments_sha256": "82b5bab1db2a4062874200d0b65f1cf461af93aea12cd658f881fad24f99f674",
       "caller": {
         "harness": "claude",
         "kind": "agent",
-        "session": "01a1e94d-1013-7fc2-9c04-292e776c2161"
+        "session": "01a1e94c-d876-7750-b2c0-2aa620c31655"
       },
       "channel": "personal",
       "credentials": {
-        "sql-read": {
-          "DB_BACKEND": "sqlite",
-          "DB_SERVICE": "apps.sqlite"
+        "jira-work": {
+          "JIRA_EMAIL": "me@example.com",
+          "JIRA_TOKEN": "not-a-real-token",
+          "JIRA_URL": "https://example.atlassian.net"
         }
       },
-      "expires_ms": 1794900030000,
-      "instance": "deaf4ff596700875cd63555429dd0a5ecc93f5454547af3ff8b524e5462f1969",
-      "issued_ms": 1794900000000,
-      "nonce": "0123456789abcdef0123456789abcdef",
-      "plugin": "sql-review",
-      "signature": "9d012a4fa6866b5816b773f1537638471a2a2dbd785475bb51c1bb0084b3ff5adb2971fd8bd1c93dbe47271a62b6d93142d1f7dbc298d79897c0a220b7c2ae01",
-      "tool": "query",
+      "expires_ms": 1794900029000,
+      "instance": "00c1f614317a651050823f12608d02702eec50feae4627cd3192b56e7d5018cc",
+      "issued_ms": 1794899999000,
+      "nonce": "0000000000000000000000005eed0000",
+      "plugin": "jira-review",
+      "signature": "e167dba19431571b95e9cdbd9d4e640760bedbf1b134ccaa60bca0b15ef78babc7de6c6b306d090b0a254ccefeeaf4c0663a71171c92d457bd83b9f40e30dd01",
+      "tool": "update",
       "v": 1
     },
-    "signature": "9d012a4fa6866b5816b773f1537638471a2a2dbd785475bb51c1bb0084b3ff5adb2971fd8bd1c93dbe47271a62b6d93142d1f7dbc298d79897c0a220b7c2ae01",
-    "signing_bytes": "747261636f6e2f76312f706c7567696e2d63616c6c000002047b22617070726f76616c5f6964223a6e756c6c2c22617267756d656e74735f736861323536223a2266393632636435653363303230343732303264393262336163643434336331636264323762313437313936366239616230343834376562326532373630306239222c2263616c6c6572223a7b226861726e657373223a22636c61756465222c226b696e64223a226167656e74222c2273657373696f6e223a2230316131653934642d313031332d376663322d396330342d323932653737366332313631227d2c226368616e6e656c223a22706572736f6e616c222c2263726564656e7469616c73223a7b2273716c2d72656164223a7b2244425f4241434b454e44223a2273716c697465222c2244425f53455256494345223a22617070732e73716c697465227d7d2c22657870697265735f6d73223a313739343930303033303030302c22696e7374616e6365223a2264656166346666353936373030383735636436333535353432396464306135656363393366353435343534376166336666386235323465353436326631393639222c226973737565645f6d73223a313739343930303030303030302c226e6f6e6365223a223031323334353637383961626364656630313233343536373839616263646566222c22706c7567696e223a2273716c2d726576696577222c22746f6f6c223a227175657279222c2276223a317d"
-  },
-  "write_tools": [
-    "apply"
-  ]
+    "signature": "e167dba19431571b95e9cdbd9d4e640760bedbf1b134ccaa60bca0b15ef78babc7de6c6b306d090b0a254ccefeeaf4c0663a71171c92d457bd83b9f40e30dd01",
+    "signing_bytes_hex": "747261636f6e2f76312f706c7567696e2d63616c6c000002457b22617070726f76616c5f6964223a226170762d30303031222c22617267756d656e74735f736861323536223a2238326235626162316462326134303632383734323030643062363566316366343631616639336165613132636436353866383831666164323466393966363734222c2263616c6c6572223a7b226861726e657373223a22636c61756465222c226b696e64223a226167656e74222c2273657373696f6e223a2230316131653934632d643837362d373735302d623263302d326161363230633331363535227d2c226368616e6e656c223a22706572736f6e616c222c2263726564656e7469616c73223a7b226a6972612d776f726b223a7b224a4952415f454d41494c223a226d65406578616d706c652e636f6d222c224a4952415f544f4b454e223a226e6f742d612d7265616c2d746f6b656e222c224a4952415f55524c223a2268747470733a2f2f6578616d706c652e61746c61737369616e2e6e6574227d7d2c22657870697265735f6d73223a313739343930303032393030302c22696e7374616e6365223a2230306331663631343331376136353130353038323366313236303864303237303265656335306665616534363237636433313932623536653764353031386363222c226973737565645f6d73223a313739343839393939393030302c226e6f6e6365223a223030303030303030303030303030303030303030303030303565656430303030222c22706c7567696e223a226a6972612d726576696577222c22746f6f6c223a22757064617465222c2276223a317d"
+  }
 }

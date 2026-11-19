@@ -473,3 +473,23 @@ async fn bad_contexts_are_refused() {
     let r = p.call_with("query", float_args, Some(ctx)).await;
     assert!(refused(&r).contains("float"), "{r}");
 }
+
+#[tokio::test]
+async fn a_signed_field_this_build_does_not_know_is_accepted() {
+    let mut p = Plugin::start().await;
+    let creds = json!({"sql-read": p.read_cred(&p.db)});
+    let args = json!({"sql": "SELECT 1 AS n"});
+
+    let mut ctx = p.context("query", &args, creds.clone());
+    ctx["preview_token"] = json!("{\"count\":1,\"hash\":\"ab12\"}");
+    p.sign(&mut ctx);
+    let r = p.call_with("query", args.clone(), Some(ctx)).await;
+    assert_eq!(rows(&r)["rows"], json!([{"n": 1}]));
+
+    let mut ctx = p.context("query", &args, creds);
+    ctx["preview_token"] = json!("{\"count\":1,\"hash\":\"ab12\"}");
+    p.sign(&mut ctx);
+    ctx["preview_token"] = json!("{\"count\":1,\"hash\":\"cd34\"}");
+    let r = p.call_with("query", args, Some(ctx)).await;
+    assert_eq!(r["error"]["data"]["check"], json!(4), "{r}");
+}
