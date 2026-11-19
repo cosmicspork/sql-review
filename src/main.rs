@@ -4,6 +4,15 @@ use std::{
     process::ExitCode,
 };
 
+fn piped_stdin() -> Option<String> {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut s = String::new();
+    stdin.lock().read_to_string(&mut s).ok().map(|_| s)
+}
+
 use clap::Parser;
 use rmcp::ServiceExt;
 use sql_review::{
@@ -11,7 +20,7 @@ use sql_review::{
     cli::{self, Cli, Command, Io},
     config::EnvSource,
     mcp::{Handler, Mode, Standalone},
-    serve,
+    serve, store,
 };
 
 #[tokio::main]
@@ -27,20 +36,12 @@ async fn main() -> ExitCode {
     };
     let code = match cli.command {
         None => {
-            let stdin = || {
-                let stdin = std::io::stdin();
-                if stdin.is_terminal() {
-                    return None;
-                }
-                let mut s = String::new();
-                stdin.lock().read_to_string(&mut s).ok().map(|_| s)
-            };
             cli::run(
                 cli.query,
                 Io {
                     env,
                     cwd,
-                    stdin: Box::new(stdin),
+                    stdin: Box::new(piped_stdin),
                     out: &mut std::io::stdout(),
                     err: &mut std::io::stderr(),
                 },
@@ -57,6 +58,25 @@ async fn main() -> ExitCode {
                     out: &mut std::io::stdout(),
                     err: &mut std::io::stderr(),
                 },
+            )
+            .await
+        }
+        Some(
+            command @ (Command::Propose(_)
+            | Command::Show(_)
+            | Command::Apply(_)
+            | Command::Review(_)),
+        ) => {
+            cli::run_write(
+                command,
+                Io {
+                    env,
+                    cwd,
+                    stdin: Box::new(piped_stdin),
+                    out: &mut std::io::stdout(),
+                    err: &mut std::io::stderr(),
+                },
+                &mut std::io::stdin().lock(),
             )
             .await
         }
@@ -112,12 +132,22 @@ async fn mcp(
         }
         profiles.retain(|p| args.profile.contains(p));
     }
+    let store = if args.read_only {
+        None
+    } else {
+        Some(
+            store::default_root(&env)
+                .and_then(store::Store::open)
+                .map_err(anyhow::Error::msg)?,
+        )
+    };
     let handler = Handler::new(Mode::Standalone(Standalone {
         env,
         cwd,
         env_file: args.env_file,
         read_only: args.read_only,
         profiles,
+        store,
     }));
     handler
         .serve(rmcp::transport::stdio())

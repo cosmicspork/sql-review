@@ -15,8 +15,8 @@ egress = []
 name = "sql-read"
 pattern = "sql-read-*"
 
-# Write account, for writes approved through review. Declared now; nothing
-# reads it until proposed writes ship.
+# Write account, for writes approved through review. Declared now; `serve`
+# reads it only once it offers a write tool, which it doesn't yet.
 [[credential]]
 name = "sql-write"
 pattern = "sql-write-*"

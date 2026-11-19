@@ -11,10 +11,9 @@ use crate::{
 pub enum Error {
     #[error("{0}")]
     Config(#[from] ConfigError),
-    /// A write. Writes will be proposed for review in a later version.
+    /// A write sent where only reads run.
     #[error(
-        "this statement writes ({0}); sql-review runs reads only for now: \
-         writes will be proposed for review in a later version"
+        "this statement writes ({0}); queries run reads only: propose a write for review instead"
     )]
     WritesUnavailable(String),
     #[error("this statement writes ({0}); writes are disabled (--read-only)")]

@@ -20,8 +20,9 @@
 //! DB_FETCH_LIMIT  default row cap                    (default: 1000)
 //! DATABASE_URL    a whole SQLAlchemy-style URL, overriding the parts above
 //! DB_TRUST_SERVER_CERTIFICATE  SQL Server: skip certificate checks (default: false)
-//! DB_WRITE_USER / DB_WRITE_PASSWORD  the write account, reserved for
-//!                 proposed writes; never read under --read-only
+//! DB_WRITE_USER / DB_WRITE_PASSWORD  the write account, for proposed
+//!                 writes; never read under --read-only
+//! DB_PREVIEW_TIMEOUT  seconds a write's preview may run   (default: 10)
 //! ```
 
 use std::{
@@ -33,6 +34,8 @@ use std::{
 use crate::backend::Kind;
 
 pub const DEFAULT_FETCH_LIMIT: u64 = 1000;
+
+pub const DEFAULT_PREVIEW_TIMEOUT_SECS: u64 = 10;
 
 /// The profile that means "the bare keys, no prefix".
 pub const DEFAULT_PROFILE: &str = "default";
@@ -74,9 +77,11 @@ pub struct Config {
     pub database_url: String,
     pub fetch_limit: u64,
     pub trust_server_certificate: bool,
-    /// The write account. Always `None` under `--read-only`, and unused until
-    /// writes are proposed for review.
+    /// The write account. Always `None` under `--read-only`.
     pub write: Option<Account>,
+    /// How long a write's preview may run before it is rolled back and shown
+    /// as not previewable.
+    pub preview_timeout: std::time::Duration,
     pub read_only: bool,
     pub env_path: Option<PathBuf>,
     pub profile: Option<String>,
@@ -111,6 +116,28 @@ impl Config {
             Ok(_) => self.database_url.clone(),
             Err(_) => "(unreadable DATABASE_URL)".into(),
         }
+    }
+
+    /// The database a proposal was made against, without any login:
+    /// `backend://host:port/database`. Apply refuses a proposal whose target
+    /// is not the one now configured.
+    pub fn target(&self) -> String {
+        let mut out = format!("{}://", self.backend.name());
+        out.push_str(self.host.as_deref().unwrap_or_default());
+        if let Some(p) = self.port {
+            let _ = write!(out, ":{p}");
+        }
+        out.push('/');
+        let database = self.database.clone().unwrap_or_default();
+        let database = match self.backend {
+            // A relative path names a different file from another directory.
+            Kind::Sqlite => std::fs::canonicalize(&database)
+                .map(|p| p.display().to_string())
+                .unwrap_or(database),
+            _ => database,
+        };
+        out.push_str(&database);
+        out
     }
 
     /// The read-only account.
@@ -229,6 +256,7 @@ const PROFILE_KEYS: &[&str] = &[
     "DB_PASSWORD",
     "DB_FETCH_LIMIT",
     "DB_TRUST_SERVER_CERTIFICATE",
+    "DB_PREVIEW_TIMEOUT",
     "DATABASE_URL",
 ];
 
@@ -308,6 +336,19 @@ pub fn resolve(source: &dyn Source, how: Resolve<'_>) -> Result<Config, ConfigEr
             .parse::<u64>()
             .map_err(|_| ConfigError(format!("DB_FETCH_LIMIT must be an integer, got {raw:?}")))?,
     };
+    let preview_timeout = match get("DB_PREVIEW_TIMEOUT") {
+        None => DEFAULT_PREVIEW_TIMEOUT_SECS as f64,
+        Some(raw) => raw
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .ok_or_else(|| {
+                ConfigError(format!(
+                    "DB_PREVIEW_TIMEOUT must be a number of seconds above 0, got {raw:?}"
+                ))
+            })?,
+    };
+    let preview_timeout = std::time::Duration::from_secs_f64(preview_timeout);
     let trust_server_certificate = match get("DB_TRUST_SERVER_CERTIFICATE") {
         None => false,
         Some(raw) => parse_bool(&raw).ok_or_else(|| {
@@ -382,6 +423,7 @@ pub fn resolve(source: &dyn Source, how: Resolve<'_>) -> Result<Config, ConfigEr
         fetch_limit,
         trust_server_certificate,
         write,
+        preview_timeout,
         read_only: how.read_only,
         env_path: how.env_path,
         profile,

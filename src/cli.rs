@@ -1,22 +1,30 @@
-//! The command line: consulta's flags, unchanged, plus `--read-only`.
+//! The command line: consulta's flags, unchanged, plus `--read-only`, and
+//! `propose`, `show`, `apply` and `review` for writes.
 //!
 //! Diagnostics go to stderr and results to stdout, so output pipes cleanly.
-//! Any error or refusal exits 2 with `ERROR: …` as the last stderr line.
+//! Any error or refusal exits 2 with `ERROR: …` as the last stderr line; an
+//! apply refused because the rows moved exits 3.
 
 use std::{
     collections::BTreeMap,
-    io::Write,
+    io::{BufRead, Write},
     path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
+    change::{self, ApplyError, Outcome, Proposal, Status},
     config::{self, Config, EnvSource, Resolve},
     render::{Format, render},
+    review,
     run::{self, Request},
+    store::{self, Store},
     value::{Param, Params},
 };
+
+/// Exit code for an apply refused because the rows moved since.
+pub const STALE: i32 = 3;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,6 +49,72 @@ pub enum Command {
     /// Check an Oracle profile step by step: connect, query, describe,
     /// read-only transaction, binds.
     CheckOracle(CheckOracleArgs),
+    /// Propose a write: preview it on the write account, roll back, and
+    /// write a proposal file.
+    Propose(ProposeArgs),
+    /// Show a proposal file, or a stored proposal by id.
+    Show(ShowArgs),
+    /// Apply a proposal, refused if its rows moved since it was proposed.
+    Apply(ApplyArgs),
+    /// Approve or reject the proposals `mcp` is waiting on.
+    Review(ReviewArgs),
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct ProposeArgs {
+    /// SQL text of the write.
+    #[arg(long)]
+    pub sql: Option<String>,
+    /// Path to a .sql file holding the write.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+    /// Bind a :NAME placeholder. Repeatable.
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
+    /// Connection profile prefix in .env (e.g. qa).
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Path to a specific .env file.
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
+    /// Where to write the proposal: a path, or - for stdout. ./<id>.json
+    /// unless given.
+    #[arg(long)]
+    pub out: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShowArgs {
+    /// A proposal file, or the id of a stored proposal.
+    pub change: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ApplyArgs {
+    /// A proposal file, or the id of a stored proposal.
+    pub change: String,
+    /// Path to a specific .env file.
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct ReviewArgs {
+    /// List what is waiting, and exit.
+    #[arg(long, conflicts_with_all = ["approve", "reject"])]
+    pub list: bool,
+    /// Approve and apply this proposal.
+    #[arg(long, conflicts_with = "reject")]
+    pub approve: Option<String>,
+    /// Reject this proposal.
+    #[arg(long)]
+    pub reject: Option<String>,
+    /// Why it was rejected; the agent waiting on it sees this.
+    #[arg(long, requires = "reject")]
+    pub reason: Option<String>,
+    /// Path to a specific .env file.
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -262,6 +336,177 @@ fn resolve_sql(
     Ok(stdin()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty()))
+}
+
+/// Run `propose`, `show`, `apply` or `review`. `input` answers `review`'s
+/// questions. Returns the exit code.
+pub async fn run_write(command: Command, io: Io<'_>, input: &mut dyn BufRead) -> i32 {
+    let Io {
+        env,
+        cwd,
+        stdin,
+        out,
+        err,
+    } = io;
+    match write_inner(command, &env, &cwd, stdin, input, out, err).await {
+        Ok(code) => code,
+        Err((code, e)) => {
+            let _ = writeln!(err, "ERROR: {e}");
+            code
+        }
+    }
+}
+
+type Failed = (i32, String);
+
+fn failed(e: impl std::fmt::Display) -> Failed {
+    (2, e.to_string())
+}
+
+/// The exit code a decided proposal ends with.
+fn outcome_code(p: &Proposal) -> i32 {
+    match p.outcome.as_ref().map(|o| o.status) {
+        Some(Status::Stale) => STALE,
+        Some(Status::Failed) => 2,
+        _ => 0,
+    }
+}
+
+async fn write_inner(
+    command: Command,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    stdin: Box<dyn FnOnce() -> Option<String> + '_>,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32, Failed> {
+    let store = || {
+        store::default_root(env)
+            .and_then(Store::open)
+            .map_err(failed)
+    };
+    let config_for = |env_file| config_for(env, cwd, env_file);
+    match command {
+        Command::Propose(args) => {
+            let cfg = load_config(
+                env.clone(),
+                cwd,
+                args.env_file.as_deref(),
+                args.profile.as_deref(),
+                false,
+            )
+            .map_err(failed)?;
+            let query = QueryArgs {
+                sql: args.sql,
+                file: args.file,
+                ..QueryArgs::default()
+            };
+            let sql = resolve_sql(&query, cwd, stdin)
+                .map_err(failed)?
+                .ok_or_else(|| failed("provide --sql, --file, or pipe SQL on stdin"))?;
+            let params = parse_params(&args.param).map_err(failed)?;
+            let store = store()?;
+            let p = change::propose(&cfg, &sql, &params).await.map_err(failed)?;
+            let target = args.out.unwrap_or_else(|| format!("{}.json", p.id));
+            if target == "-" {
+                let _ = write!(out, "{}", p.to_json());
+                let _ = write!(err, "{}", change::render(&p));
+            } else {
+                let path = cwd.join(&target);
+                store::write_atomic(&path, &p.to_json()).map_err(failed)?;
+                let _ = write!(out, "{}", change::render(&p));
+                let _ = writeln!(err, "proposal written to {}", path.display());
+            }
+            store.log_proposed(&p);
+            Ok(0)
+        }
+        Command::Show(args) => {
+            let (_, p) = load(&args.change, cwd, store)?;
+            let _ = write!(out, "{}", change::render(&p));
+            Ok(0)
+        }
+        Command::Apply(args) => {
+            let (path, p) = load(&args.change, cwd, store)?;
+            let store = store()?;
+            let config = config_for(args.env_file.as_deref());
+            let Some(path) = path else {
+                // A stored proposal is decided through the store, so an
+                // agent waiting on it hears.
+                let done = review::approve(&store, &args.change, config)
+                    .await
+                    .map_err(failed)?;
+                let _ = write!(out, "{}", review::describe(&done));
+                return Ok(outcome_code(&done));
+            };
+            let cfg = config(p.profile.as_deref()).map_err(failed)?;
+            let applied = change::apply(&p, &cfg).await;
+            let mut decided = p.clone();
+            decided.outcome = Some(Outcome::of(&applied));
+            store.log_decided(&decided);
+            match applied {
+                Err(ApplyError::Invalid(e)) => Err(failed(e)),
+                // Rolled back: leave the file as it was.
+                Err(e @ ApplyError::Stale(_)) => Err((STALE, e.to_string())),
+                _ => {
+                    store::write_atomic(&path, &decided.to_json()).map_err(failed)?;
+                    let _ = write!(out, "{}", review::describe(&decided));
+                    Ok(outcome_code(&decided))
+                }
+            }
+        }
+        Command::Review(args) => {
+            let store = store()?;
+            let config = config_for(args.env_file.as_deref());
+            if args.list {
+                let _ = write!(out, "{}", review::list(&store).map_err(failed)?);
+            } else if let Some(id) = &args.approve {
+                let done = review::approve(&store, id, config).await.map_err(failed)?;
+                let _ = write!(out, "{}", review::describe(&done));
+                return Ok(outcome_code(&done));
+            } else if let Some(id) = &args.reject {
+                let done = review::reject(&store, id, args.reason.clone()).map_err(failed)?;
+                let _ = write!(out, "{}", review::describe(&done));
+            } else {
+                review::interactive(&store, config, input, out)
+                    .await
+                    .map_err(failed)?;
+            }
+            Ok(0)
+        }
+        _ => Err(failed("not a write command")),
+    }
+}
+
+/// Settings for a proposal's profile, write account included.
+fn config_for<'a>(
+    env: &'a BTreeMap<String, String>,
+    cwd: &'a Path,
+    env_file: Option<&'a Path>,
+) -> impl Fn(Option<&str>) -> Result<Config, String> + 'a {
+    move |profile| {
+        load_config(env.clone(), cwd, env_file, profile, false).map_err(|e| e.to_string())
+    }
+}
+
+/// A proposal from a file, else from the store by id.
+fn load(
+    change: &str,
+    cwd: &Path,
+    store: impl FnOnce() -> Result<Store, Failed>,
+) -> Result<(Option<PathBuf>, Proposal), Failed> {
+    let path = cwd.join(change);
+    if path.is_file() {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| failed(format!("could not read {}: {e}", path.display())))?;
+        return Ok((Some(path), Proposal::from_json(&text).map_err(failed)?));
+    }
+    match store()?.get(change).map_err(failed)? {
+        Some((_, p)) => Ok((None, p)),
+        None => Err(failed(format!(
+            "no proposal file or stored proposal {change}"
+        ))),
+    }
 }
 
 /// `NAME=VALUE` pairs, bound as text as consulta bound them.

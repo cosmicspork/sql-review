@@ -9,7 +9,7 @@ repository = "https://github.com/cosmicspork/sql-review"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
 dotenvy = "0.15"
@@ -29,6 +29,7 @@ tiberius = { version = "0.13", default-features = false, features = ["rustls", "
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "io-std", "sync", "fs"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 url = "2"
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

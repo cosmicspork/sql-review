@@ -321,8 +321,8 @@ async fn writes_are_refused_and_change_nothing() {
     assert_eq!(out.code, 2);
     assert_eq!(
         out.stderr.lines().last().unwrap(),
-        "ERROR: this statement writes (DELETE); sql-review runs reads only for now: \
-         writes will be proposed for review in a later version"
+        "ERROR: this statement writes (DELETE); queries run reads only: \
+         propose a write for review instead"
     );
     let out = f
         .cli(&["--sql", "DELETE FROM apps", "--quiet", "--read-only"])
