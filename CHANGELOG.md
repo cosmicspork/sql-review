@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/cosmicspork/sql-review/compare/v0.2.0...v0.3.0) (2026-11-20)
+
+
+### Features
+
+* never run a write to preview it, and offer write as a plugin tool ([#9](https://github.com/cosmicspork/sql-review/issues/9)) ([4b8f82d](https://github.com/cosmicspork/sql-review/commit/4b8f82df5623d1499d3967e0b227a9ecb7abcd8b))
+
 ## [0.2.0](https://github.com/cosmicspork/sql-review/compare/v0.1.0...v0.2.0) (2026-11-20)
 
 

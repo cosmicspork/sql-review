@@ -1,7 +1,7 @@
 # Tracon plugin contract v1. The release archive holds this file and
 # bin/sql-review; Tracon runs `exec` with --socket <path> --data <dir>.
 name = "sql-review"
-version = "0.2.0"
+version = "0.3.0"
 contract = 1
 exec = ["bin/sql-review", "serve"]
 # The database hosts depend on each deployment's credentials, so none are
