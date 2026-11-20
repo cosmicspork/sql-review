@@ -1,6 +1,6 @@
 [package]
 name = "sql-review"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 edition = "2024"
 description = "Read-only SQL for people and agents: a CLI, an MCP server and a Tracon plugin"
