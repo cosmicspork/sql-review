@@ -118,6 +118,29 @@ fn the_valid_context_passes_and_each_refused_one_fails_at_its_check() {
     }
 }
 
+/// A call dispatched from an approved card carries the preview's token in
+/// its signed context: the shared vector for it signs and passes as it is.
+#[test]
+fn the_preview_token_vector_reproduces_and_passes() {
+    let v = vectors();
+    let case = &v["valid_preview_token"];
+    let ctx = &case["context"];
+    assert!(ctx["preview_token"].is_string());
+    assert_eq!(
+        canonical(&case["call"]["arguments"]).unwrap(),
+        case["arguments_canonical"].as_str().unwrap()
+    );
+    let bytes = signing_bytes(ctx).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        case["signing_bytes_hex"].as_str().unwrap()
+    );
+    let sig = hex::encode(key_from(&v).sign(&bytes).to_bytes());
+    assert_eq!(sig, case["signature"].as_str().unwrap());
+    assert_eq!(sig, ctx["signature"].as_str().unwrap());
+    assert_eq!(verify(&verifier(&v), &v, &case["call"], ctx), Ok(()));
+}
+
 /// The node adds fields to the context over time (`preview_token` on an
 /// approved dispatch is the first). The signature covers the object as
 /// received, so a field this build doesn't know passes when signed and is
