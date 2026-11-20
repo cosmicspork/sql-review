@@ -1,20 +1,18 @@
 //! SQLite through rusqlite (bundled). For reads the file is opened read-only
 //! and the connection set to `query_only`, so SQLite itself refuses any
-//! write. Proposed writes open it read-write; SQLite has no logins, so the
-//! write account's settings only switch that on.
+//! write. An approved write opens it read-write; SQLite has no logins, so
+//! the write account's settings only switch that on.
 //!
-//! SQLite has no row locks. A preview and an apply each start with `BEGIN
-//! IMMEDIATE`, which takes the database's write lock, so nothing else
-//! writes between reading the rows and committing.
+//! A proposal reads the rows a write would change on the read-only
+//! connection and never runs the write. SQLite has no row locks, so an
+//! apply starts with `BEGIN IMMEDIATE`, which takes the database's write
+//! lock: nothing else writes between reading the rows and committing.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, Statement, types::ValueRef};
 
-use super::{
-    ApplyFail, DbError, Expected, Previewed, SyncConn, WritePlan, apply_on, preview_on,
-    take_limited,
-};
+use super::{ApplyFail, DbError, Expected, SyncConn, WritePlan, apply_on, take_limited};
 use crate::{
     config::Config,
     value::{Cell, Param, Params, ResultSet},
@@ -70,31 +68,24 @@ impl SyncConn for Connection {
     }
 }
 
-pub async fn preview(
+/// The rows a write would change, read on a read-only, `query_only`
+/// connection. Interrupted, and `None`, after `limit`.
+pub async fn read_rows(
     cfg: &Config,
-    plan: &WritePlan,
-    sample: usize,
+    sql: &str,
+    params: &Params,
     limit: Duration,
-) -> Result<Option<Previewed>, DbError> {
-    let (cfg, plan) = (cfg.clone(), plan.clone());
-    let deadline = Instant::now() + limit;
+) -> Result<Option<ResultSet>, DbError> {
+    let (cfg, sql, params) = (cfg.clone(), sql.to_string(), params.clone());
     let (tx, rx) = std::sync::mpsc::channel();
     let mut task = tokio::task::spawn_blocking(move || {
-        let conn = open_write(&cfg, limit)?;
+        let conn = open(&cfg)?;
         let _ = tx.send(conn.get_interrupt_handle());
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(DbError::query)?;
-        let out = preview_on(&conn, &plan, sample, deadline);
-        let rolled_back = conn
-            .execute_batch("ROLLBACK")
-            .map_err(|e| DbError(format!("rollback failed: {e}")));
-        let out = out?;
-        rolled_back?;
-        Ok(out)
+        read_on(&conn, &sql, &params, 0)
     });
     match tokio::time::timeout(limit, &mut task).await {
         Ok(joined) => joined
-            .map_err(|e| DbError(format!("the preview task failed: {e}")))?
+            .map_err(|e| DbError(format!("the read task failed: {e}")))?
             .map(Some),
         Err(_) => {
             if let Ok(handle) = rx.try_recv() {

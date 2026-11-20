@@ -16,9 +16,13 @@
 //!   "expires_ms": 0,
 //!   "nonce": "<32 lowercase hex chars (16 random bytes)>",
 //!   "credentials": { "<credential name>": { "<FIELD>": "<value>" } },
+//!   "preview_token": "<the token of the preview the operator approved>",
 //!   "signature": "<lowercase hex ed25519 signature>"
 //! }
 //! ```
+//!
+//! `preview_token` is optional: the node adds it to a call dispatched from
+//! an approved card whose `tracon/preview` returned a token.
 //!
 //! **Signing bytes:** the ASCII label `tracon/v1/plugin-call`, then the
 //! canonical JSON of the object without `signature`, prefixed by its length
@@ -39,7 +43,9 @@
 //!    `expires_ms - issued_ms <= 60000`.
 //! 6. `nonce` is 32 lowercase hex and unseen; it is remembered until
 //!    `expires_ms + 5000`. Only a call that passed 1–5 records its nonce.
-//! 7. A write tool needs a non-null `approval_id`.
+//! 7. A write tool needs a non-null `approval_id`. A `tracon/preview`
+//!    carries the same context with `approval_id` null, so a preview runs
+//!    checks 1–6 only ([`Verifier::verify_preview`]).
 
 use std::{collections::BTreeMap, sync::Mutex};
 
@@ -95,6 +101,8 @@ pub struct TraconContext {
     pub nonce: String,
     #[serde(default)]
     pub credentials: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub preview_token: Option<String>,
     pub signature: String,
 }
 
@@ -113,6 +121,8 @@ pub struct Verified {
     pub caller: Caller,
     /// The credentials lent to this call, by bound name.
     pub credentials: BTreeMap<String, BTreeMap<String, String>>,
+    /// The token of the preview the operator approved, if the call carries one.
+    pub preview_token: Option<String>,
 }
 
 impl std::fmt::Debug for Verified {
@@ -121,6 +131,7 @@ impl std::fmt::Debug for Verified {
         f.debug_struct("Verified")
             .field("caller", &self.caller)
             .field("credentials", &self.credentials.keys().collect::<Vec<_>>())
+            .field("preview_token", &self.preview_token)
             .finish()
     }
 }
@@ -279,6 +290,30 @@ impl Verifier {
         arguments: Option<&Map<String, Value>>,
         now_ms: i64,
     ) -> Result<Verified, Refusal> {
+        self.check(context, tool, arguments, now_ms, true)
+    }
+
+    /// Checks 1–6 for a `tracon/preview` of `tool`: a preview needs no
+    /// approval, and the node never lends it a `lend = "approved"`
+    /// credential.
+    pub fn verify_preview(
+        &self,
+        context: &Value,
+        tool: &str,
+        arguments: Option<&Map<String, Value>>,
+        now_ms: i64,
+    ) -> Result<Verified, Refusal> {
+        self.check(context, tool, arguments, now_ms, false)
+    }
+
+    fn check(
+        &self,
+        context: &Value,
+        tool: &str,
+        arguments: Option<&Map<String, Value>>,
+        now_ms: i64,
+        needs_approval: bool,
+    ) -> Result<Verified, Refusal> {
         // 1. Version and plugin, read before anything else so a context from
         // a later version is refused as one, not as malformed.
         let obj = context
@@ -362,7 +397,7 @@ impl Verifier {
         }
 
         // 7. A write only with an approval.
-        if self.write_tools.contains(&ctx.tool) && ctx.approval_id.is_none() {
+        if needs_approval && self.write_tools.contains(&ctx.tool) && ctx.approval_id.is_none() {
             return Err(Refusal::Approval(ctx.tool));
         }
 
@@ -375,6 +410,7 @@ impl Verifier {
                 approval_id: ctx.approval_id,
             },
             credentials: ctx.credentials,
+            preview_token: ctx.preview_token,
         })
     }
 }
@@ -518,6 +554,44 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.check(), 3);
         assert!(e.to_string().contains("float"), "{e}");
+    }
+
+    #[test]
+    fn a_preview_of_a_write_needs_no_approval_and_a_call_does() {
+        let args = json!({"sql": "DELETE FROM apps"});
+        let v = verifier();
+        let mut ctx = context(&args, 1_000_000);
+        ctx["tool"] = json!("apply");
+        sign(&mut ctx);
+        assert!(
+            v.verify_preview(&ctx, "apply", args.as_object(), 1_000_000)
+                .is_ok()
+        );
+        ctx["nonce"] = json!("ffeeddccbbaa99887766554433221100");
+        sign(&mut ctx);
+        let e = v
+            .verify(&ctx, "apply", args.as_object(), 1_000_000)
+            .unwrap_err();
+        assert_eq!(e.check(), 7);
+    }
+
+    #[test]
+    fn the_preview_token_is_read_when_present() {
+        let args = json!({});
+        let mut ctx = context(&args, 1_000_000);
+        ctx["approval_id"] = json!("ap-1");
+        ctx["preview_token"] = json!("tok");
+        sign(&mut ctx);
+        let ok = verifier()
+            .verify(&ctx, "query", args.as_object(), 1_000_000)
+            .unwrap();
+        assert_eq!(ok.preview_token.as_deref(), Some("tok"));
+        assert_eq!(ok.caller.approval_id.as_deref(), Some("ap-1"));
+        let ctx = context(&args, 1_000_000);
+        let ok = verifier()
+            .verify(&ctx, "query", args.as_object(), 1_000_000)
+            .unwrap();
+        assert_eq!(ok.preview_token, None);
     }
 
     #[test]

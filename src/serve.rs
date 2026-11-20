@@ -16,7 +16,8 @@ use tokio::net::UnixListener;
 use crate::{
     cli::ServeArgs,
     contract::{self, Verifier},
-    mcp::{Handler, Mode},
+    mcp::{Handler, Mode, Plugin},
+    store::Store,
 };
 
 /// The settings the node starts a plugin with, read once.
@@ -53,7 +54,7 @@ pub async fn serve(args: ServeArgs, start: Start) -> anyhow::Result<()> {
         .with_context(|| format!("could not create {}", args.data.display()))?;
     let listener = bind(&args.socket)?;
 
-    let verifier = Arc::new(Verifier::new(
+    let verifier = Verifier::new(
         crate::PLUGIN_NAME,
         start.instance,
         start.node_key,
@@ -62,8 +63,14 @@ pub async fn serve(args: ServeArgs, start: Start) -> anyhow::Result<()> {
             .filter(|(_, hint)| *hint == "write")
             .map(|(name, _)| name.to_string())
             .collect(),
-    ));
-    let handler = Handler::new(Mode::Plugin(verifier));
+    );
+    // Applied writes are kept and logged here, as standalone keeps them in
+    // its state directory. Previews write nothing.
+    let store = Store::open(&args.data).map_err(anyhow::Error::msg)?;
+    let handler = Handler::new(Mode::Plugin(Arc::new(Plugin {
+        verifier,
+        store: Some(store),
+    })));
     let ct = tokio_util::sync::CancellationToken::new();
     // The socket is reachable only through the node's private directory, so
     // there is no Host header worth checking.

@@ -2,7 +2,7 @@
 
 Read-only SQL queries for people and agents, with writes proposed for review before they apply. Oracle, SQL Server and SQLite; a CLI, an MCP server, and a Tracon plugin.
 
-Reads run at once. A write is proposed: sql-review previews it on the write account in a transaction it rolls back, records what it would change, and applies it only after review, refusing if those rows moved in between. Standalone, that is `propose`, `show`, `apply` and `review` on the command line and a `write` tool in `sql-review mcp`; as a Tracon plugin, `serve` offers reads only for now.
+Reads run at once. A write is proposed, and **no write is ever run to preview it**: for a single-table `UPDATE` or `DELETE`, sql-review reads the rows its `WHERE` selects on the read-only account and records them; it applies the write only after review, on the write account, refusing if those rows moved in between. Standalone, that is `propose`, `show`, `apply` and `review` on the command line and a `write` tool in `sql-review mcp`; as a Tracon plugin, `serve` offers `write` with `tracon/preview`, and the node's approval card is the review.
 
 sql-review replaces [consulta](https://github.com/cosmicspork/consulta): the same flags, the same `.env` keys, the same output formats, in one static binary with no Python, no Oracle Instant Client and no ODBC.
 
@@ -64,22 +64,20 @@ A write goes through review in two steps, and nothing is committed until the sec
 
 ```sh
 sql-review propose --sql "UPDATE adm_applications SET status = 'HELD' WHERE strm = :strm" --param strm=1261
-sql-review show 01a1f55e-….json      # the statement, row count, rows before and after
+sql-review show 01a1f55e-….json      # the statement, the row count and the rows as they are now
 sql-review apply 01a1f55e-….json     # commits only if those rows haven't moved
 ```
 
-`propose` takes SQL as a query does (`--sql`, `--file`, stdin, `--param`, `--profile`, `--env-file`) and writes the proposal to `./<id>.json` (`--out PATH`, or `--out -` for stdout). It needs the write account (`DB_WRITE_USER`, `DB_WRITE_PASSWORD`, with the same profile prefixes) and runs the statement on it inside a transaction it always rolls back. What it records depends on the statement:
+`propose` takes SQL as a query does (`--sql`, `--file`, stdin, `--param`, `--profile`, `--env-file`) and writes the proposal to `./<id>.json` (`--out PATH`, or `--out -` for stdout). It never runs the statement, and it needs only the read-only account: the write account is used by `apply` alone. Rolling back is not reliable everywhere (DDL commits implicitly on Oracle and MySQL, MyISAM has no transactions, and sequences, autonomous-transaction triggers and external effects survive a rollback), so nothing is run to see what it would do. What it records depends on the statement:
 
-| Statement | Preview | What apply checks |
+| Statement | What propose records | What apply checks |
 | --- | --- | --- |
-| A single-table `UPDATE` or `DELETE` | The rows its `WHERE` selects (the first 20 shown, before and, for an update, after), the row count, and a hash of every affected row | The hash and the count |
-| An `INSERT` | The row count; it has no prior rows | The count |
-| Other DML: joins, subqueries, `MERGE`, `ORDER BY`/`LIMIT` | The row count only, and the proposal says so | The count |
-| DDL, procedure calls, PL/SQL and T-SQL blocks, anything a rollback can't undo | Never run; the statement alone, marked "not previewable" | Nothing: it runs as written |
+| A single-table `UPDATE` or `DELETE` | `SELECT * FROM <table> WHERE <its WHERE>`, run on the read-only account in the backend's read-only transaction: the row count, the first 20 rows as they are now, and a hash of every row | The locked rows' count and hash, then the statement's own row count, all against that count and hash |
+| Anything else: `INSERT`, joins, subqueries, `MERGE`, `ORDER BY`/`LIMIT`, DDL, procedure calls, PL/SQL and T-SQL blocks | The statement alone, marked "not previewable", with the reason | Nothing: it runs as written |
 
-A preview runs the statement for real inside its transaction: triggers fire, sequences advance and stay advanced, and the affected rows are locked while it runs. It has a time limit, `DB_PREVIEW_TIMEOUT` seconds (default 10); a statement that runs over is rolled back and proposed as not previewable. One statement per proposal; a read is refused.
+The rows shown are the rows as they are, not as they will be: there is no "after". Reading them has a time limit, `DB_PREVIEW_TIMEOUT` seconds (default 10); a read that runs over is stopped and the write proposed as not previewable. One statement per proposal; a read is refused. Proposal files are format 2; a format 1 file, written by 0.2 when propose still ran the statement, is refused, so propose it again.
 
-`apply` takes a proposal file or a stored proposal's id. In one transaction on the write account it selects the affected rows locked (`FOR UPDATE` on Oracle, `WITH (UPDLOCK, HOLDLOCK)` on SQL Server; SQLite has no row locks, so the transaction starts with `BEGIN IMMEDIATE`, which takes the database's write lock and keeps every other writer out until it ends), refuses if their hash changed, runs the statement, and commits only if the row count matches. A refusal rolls back, leaves the file as it was and exits 3. A proposal is applied only to the database it was proposed against, and only once: the outcome is written back into the file.
+`apply` takes a proposal file or a stored proposal's id, and needs the write account (`DB_WRITE_USER`, `DB_WRITE_PASSWORD`, with the same profile prefixes). In one transaction on the write account it selects the affected rows locked (`FOR UPDATE` on Oracle, `WITH (UPDLOCK, HOLDLOCK)` on SQL Server; SQLite has no row locks, so the transaction starts with `BEGIN IMMEDIATE`, which takes the database's write lock and keeps every other writer out until it ends), refuses if their count or hash differ from what propose read, runs the statement, and commits only if it changed exactly that many rows. A refusal rolls back, leaves the file as it was and exits 3. A proposal is applied only to the database it was proposed against, and only once: the outcome is written back into the file.
 
 Every proposal and decision is logged to `log.jsonl` in the state directory (below) and on stderr: the statement, its parameters, row counts and hashes, never a credential.
 
@@ -94,7 +92,7 @@ Each answers with JSON text: `{"columns": [...], "rows": [{...}], "row_count": n
 
 Unless `--read-only` is given, it also serves two write tools:
 
-- `write {sql, params?, profile?}`: propose one write, as `sql-review propose` does. It answers at once with a `proposal_id`, the rendered preview, and `status: "pending"`; nothing is committed.
+- `write {sql, params?, profile?}`: propose one write, as `sql-review propose` does. It answers at once with a `proposal_id`, the rendered proposal, and `status: "pending"`; nothing is run.
 - `proposal_status {id, wait_secs?}`: wait up to `wait_secs` (at most 45, default 30) for a person to decide. `status` is `pending`, `approved` (with `row_count`), `rejected` (with the reviewer's `reason`), `stale` (the rows moved; propose again) or `failed`.
 
 A person decides in a terminal with `sql-review review`, which goes through what is waiting, oldest first, showing each proposal and asking to approve, reject, skip or quit. `review --list` lists them, `review --approve ID` and `review --reject ID [--reason TEXT]` decide one, and `sql-review apply ID` and `sql-review show ID` work on stored proposals too. Approving applies it on the write account, with the checks above. Proposals wait in `pending/` and move to `decided/` under the state directory: `SQL_REVIEW_STATE`, else `$XDG_STATE_HOME/sql-review`, else `~/Library/Application Support/sql-review` on macOS and `~/.local/state/sql-review` elsewhere.
@@ -114,7 +112,7 @@ A person decides in a terminal with `sql-review review`, which goes through what
 
 ### Tracon plugin
 
-Under [Tracon](https://github.com/cosmicspork/tracon), the node installs a release archive and runs `bin/sql-review serve --socket <path> --data <dir>`. It serves the same two tools over MCP (streamable HTTP) on that Unix socket, with credentials lent per call by the node, never read from the environment or a `.env` file. See [The plugin contract](#the-plugin-contract) below.
+Under [Tracon](https://github.com/cosmicspork/tracon), the node installs a release archive and runs `bin/sql-review serve --socket <path> --data <dir>`. It serves `query`, `describe` and `write` over MCP (streamable HTTP) on that Unix socket, with credentials lent per call by the node, never read from the environment or a `.env` file. A `write` runs only once the operator approves its card. See [The plugin contract](#the-plugin-contract) below.
 
 ## Configuration
 
@@ -131,8 +129,8 @@ Standalone, every value comes from the process environment or a `.env` file: `--
 | `DB_FETCH_LIMIT` | Default row cap (default 1000) |
 | `DATABASE_URL` | A whole URL, overriding the parts: `oracle[+driver]://user:pass@host:port/?service_name=SVC` (or `/SVC`), `mssql[+driver]://user:pass@host:port/db`, `sqlite:///relative.db`, `sqlite:////absolute.db` |
 | `DB_TRUST_SERVER_CERTIFICATE` | SQL Server: accept the server's certificate unchecked (default `false`) |
-| `DB_WRITE_USER`, `DB_WRITE_PASSWORD` | The write account, used only to preview and apply proposed writes. `--read-only` never reads it. SQLite has no logins: setting `DB_WRITE_USER` to anything is what lets proposals open the file read-write. |
-| `DB_PREVIEW_TIMEOUT` | Seconds a write's preview may run (default 10) |
+| `DB_WRITE_USER`, `DB_WRITE_PASSWORD` | The write account, used only to apply a proposed write, never to preview one. `--read-only` never reads it. SQLite has no logins: setting `DB_WRITE_USER` to anything is what lets `apply` open the file read-write. |
+| `DB_PREVIEW_TIMEOUT` | Seconds reading a write's rows at propose may take, on the read-only account (default 10) |
 
 **Profiles.** With `--profile NAME` (or `DB_PROFILE`), a `NAME_`-prefixed key such as `QA_DB_HOST` is tried before the bare `DB_HOST`, key by key, so one `.env` holds several databases. `--profile default` means the bare keys. For `sql-review mcp`, the profiles are every prefix with a `<P>_DB_*` or `<P>_DATABASE_URL` key, lowercased, plus `default` when bare keys configure one.
 
@@ -164,7 +162,7 @@ pattern = "sql-read-*"
 [[credential]]
 name = "sql-write"
 pattern = "sql-write-*"
-lend = "approved"    # declared now; serve reads it only once it offers a write tool
+lend = "approved"    # lent only to a call dispatched from an approved card
 
 [[tool]]
 name = "query"
@@ -173,6 +171,11 @@ hint = "read"
 [[tool]]
 name = "describe"
 hint = "read"
+
+[[tool]]
+name = "write"
+hint = "write"
+consequential = true
 ```
 
 ### Start
@@ -181,7 +184,24 @@ The node runs `exec` with `--socket <path> --data <dir>` and an empty environmen
 
 ### Credentials
 
-Each call's credentials arrive in its caller context. `sql-read` is the default profile and `sql-read-<profile>` any other; their fields are the bare `DB_*` keys above (no prefixes). A call that names a profile whose credential wasn't lent fails with `credential sql-read-<profile> was not lent to this call`. `sql-write` is never read in this version: `serve` offers no write tool yet.
+Each call's credentials arrive in its caller context. `sql-read` is the default profile and `sql-read-<profile>` any other; their fields are the bare `DB_*` keys above (no prefixes). A call that names a profile whose credential wasn't lent fails with `credential sql-read-<profile> was not lent to this call`.
+
+`sql-write` (and `sql-write-<profile>`) is the write account, and is read only by an approved `write`. Its fields are the same `DB_*` keys: `DB_USER` and `DB_PASSWORD` (or a `DATABASE_URL`'s login) are the write account. Connection fields it leaves out are taken from the profile's `sql-read`; any it gives must name the same database, or the write is refused. `query`, `describe` and every preview read with `sql-read` only, whatever else is lent.
+
+### Writes: `tracon/preview` and an approved `write`
+
+When an approval card for a `write` opens, the node sends `tracon/preview` with the call's `name`, `arguments` and a caller context (`approval_id` null; checks 1 to 6 apply, 7 does not). sql-review proposes the write as `propose` does, on `sql-read`, without running it, and answers:
+
+```json
+{ "previewable": true,
+  "summary": "UPDATE apps SET score = 0 WHERE strm = '1261' (2 row(s))",
+  "body": "<Markdown: the statement in a sql code block, the row count, and the rows as they are now as a table>",
+  "token": "{\"count\":2,\"rows_hash\":\"<sha256 hex>\"}" }
+```
+
+Anything but a single-table `UPDATE` or `DELETE` answers `previewable: false`, `token: null`, and a body with the statement and why it can't be previewed. `query` and `describe` answer `previewable: false` with a one-line body. A preview sends nothing to the database but that read and writes nothing, not even the plugin's log. One that cannot be taken (no `sql-read` lent, a read refused as a write, the read failing) is error `-32003` with the reason; an unknown tool is `-32602`; any other `tracon/…` method is `-32601`.
+
+The approved `tools/call` of `write` carries `approval_id` (check 7 refuses it without one), the `sql-write` credential, and `preview_token` when the preview returned one. With a token, sql-review applies against it as `apply` does: one transaction on the write account, the rows locked, refused if their count or hash moved, committed only if the statement changed that many rows. A refusal because they moved is JSON-RPC error `-32002` with `data: {"stale": true}`, and nothing is committed. Without a token (not previewable), it runs the statement in one transaction on the write account and commits. A token that doesn't parse, or one sent with a statement that has no rows to check, is `-32602`. Each applied or refused write is kept in the data directory as `decided/<id>.json` and logged to `log.jsonl` there, as standalone keeps them.
 
 ### Caller context, wire format v1
 
@@ -201,11 +221,12 @@ Provisional, and shared with jira-review and Tracon's node. Every `tools/call` c
   "expires_ms": 0,
   "nonce": "<32 lowercase hex chars (16 random bytes)>",
   "credentials": { "<credential name>": { "<FIELD>": "<value>" } },
+  "preview_token": "<the token of the preview the operator approved; optional>",
   "signature": "<lowercase hex ed25519 signature>"
 }
 ```
 
-`caller.kind = "plugin"` is reserved for plugin-to-plugin calls through the node; it is accepted, and nothing sends it yet.
+`preview_token` is present only on a call dispatched from an approved card whose preview returned a token; absent and `null` mean the same. `caller.kind = "plugin"` is reserved for plugin-to-plugin calls through the node; it is accepted, and nothing sends it yet.
 
 **Signing bytes:** the ASCII label `tracon/v1/plugin-call`, then a big-endian u32 length and the canonical JSON of the whole object with `signature` removed (the convention of `proto/src/admin.rs` in Tracon). `signature` is ed25519 over those bytes with the node key. sql-review computes them on the object as received, so a field it doesn't know is still covered.
 
@@ -219,7 +240,7 @@ Provisional, and shared with jira-review and Tracon's node. Every `tools/call` c
 4. The signature verifies under `TRACON_NODE_KEY` (strict ed25519).
 5. `issued_ms - 5000 <= now <= expires_ms + 5000`, and `expires_ms - issued_ms <= 60000`.
 6. `nonce` is 32 lowercase hex characters and hasn't been seen; it is remembered until `expires_ms + 5000`. A call refused by checks 1–5 does not use up its nonce.
-7. A write tool needs a non-null `approval_id`. `serve` has no write tools yet.
+7. A write tool (`write`) needs a non-null `approval_id`. A `tracon/preview` runs checks 1 to 6 only.
 
 A call without `_meta.tracon` is refused. A call that passes has its caller (kind, session, channel) logged on stderr, never its credentials or parameters.
 
@@ -239,10 +260,10 @@ It connects, runs `SELECT 1 FROM DUAL`, runs a query of typed values through eve
 
 ## What is verified and what isn't
 
-- **SQLite**: verified end to end in the test suite: the CLI (every format, describe, params, limits, profiles, `.env` discovery, `--read-only`, refusals), `mcp` over stdio, and `serve` over a Unix socket with signed contexts and lent credentials, including a write sent past the classifier failing on the read-only connection. Proposed writes are verified end to end on SQLite in `tests/writes.rs` and the `mcp` tests: an `UPDATE` previewed with its rows before and after and applied; a change to those rows after propose making apply refuse as stale (and a new matching row, and an insert whose count moved); an `ALTER` proposed as not previewable, left unrun, and applied; count-only DML; a preview over its time limit rolled back; a write sent straight to the read path failing on the read-only connection with the write account configured; `review` approving, rejecting and refusing stale, interactively and by flag; and `mcp --read-only` listing no write tools.
+- **SQLite**: verified end to end in the test suite: the CLI (every format, describe, params, limits, profiles, `.env` discovery, `--read-only`, refusals), `mcp` over stdio, and `serve` over a Unix socket with signed contexts and lent credentials, including a write sent past the classifier failing on the read-only connection. Proposed writes are verified end to end on SQLite in `tests/writes.rs` and the `mcp` tests: an `UPDATE` proposed with its rows as they are now and applied; propose working with no write account on a database file nobody may write; a change to those rows after propose making apply refuse as stale (and a new matching row); apply checking the count read at propose; an `ALTER`, an `INSERT` and DML with a subquery proposed as not previewable, left unrun, and applied as written; the read's time limit; a write sent straight to the read path failing on the read-only connection with the write account configured; `review` approving, rejecting and refusing stale, interactively and by flag; and `mcp --read-only` listing no write tools. The plugin's `write` is verified in `tests/serve.rs`: an `UPDATE` previewed with its rows, count and token and then applied; a change between preview and apply refused as stale (`-32002`, `data.stale`); an `ALTER` not previewable and applied once approved; `write` refused without an approval; a preview that works on a read-only file with an unusable `sql-write` lent and fails with only `sql-write` lent; a write sent through `query` with `sql-write` lent still refused and failing read-only; malformed tokens; and `sql-write` naming another database.
 - **The contract**: verified against jira-review's test vectors (shared with Tracon's node) and the `serve` tests. The node side is being written in parallel; until it calls this build, the wire format is checked only against itself.
-- **SQL Server**: integration tests in `tests/mssql.rs` run only when `SQL_REVIEW_TEST_MSSQL_URL` points at a server; they have not been run yet. The `:name` placeholder rewrite is unit-tested. Proposed writes are written (write login, `XACT_ABORT ON`, `UPDLOCK, HOLDLOCK` at apply, the preview's time limit by dropping the connection) and compile, but are **unverified**: no test reaches a server. SQL Server has no row locator sql-review uses, so an `UPDATE`'s preview shows rows before but not after.
-- **Oracle**: built on Oracle's pure-Rust driver (`oracledb`, pinned to `26.0.0-beta.6`) and unit-tested where it can be (connect strings, number mapping), but **unverified against a database** until `check-oracle` is run against one. Proposed writes (the write account with autocommit off, `ROWID` to find an update's rows again, `FOR UPDATE` at apply, the preview's time limit as the driver's call timeout) compile and their queries are unit-tested, but are **unverified**: `check-oracle` doesn't exercise them, and no test reaches a database.
+- **SQL Server**: integration tests in `tests/mssql.rs` run only when `SQL_REVIEW_TEST_MSSQL_URL` points at a server; they have not been run yet. The `:name` placeholder rewrite is unit-tested. Proposed writes are written (the rows read on the read-only login at `READ COMMITTED` in a rolled-back transaction, the read's time limit by dropping the connection, then the write login, `XACT_ABORT ON` and `UPDLOCK, HOLDLOCK` at apply) and compile, but are **unverified**: no test reaches a server. The statement's row count comes from the server's done tokens, so a trigger that changes other rows may make the counts differ, and apply then refuses as stale rather than commit.
+- **Oracle**: built on Oracle's pure-Rust driver (`oracledb`, pinned to `26.0.0-beta.6`) and unit-tested where it can be (connect strings, number mapping), but **unverified against a database** until `check-oracle` is run against one. Proposed writes (the rows read on the read-only account inside `SET TRANSACTION READ ONLY` under the driver's call timeout, then the write account with autocommit off and `FOR UPDATE` at apply) compile and their queries are unit-tested. One single-table `UPDATE` was proposed, applied, refused as stale and reverted on a test database with 0.2, when propose still ran the statement; this build's propose, which never runs it, has not yet been run on Oracle. Row-level security that shows the read-only account fewer rows than the write account would make apply refuse as stale.
 - **Release builds**: both Linux targets have been built locally the way the release workflow builds them (`cargo zigbuild`, zig 0.15.2) and come out statically linked; the x86_64 binary was run, the aarch64 one only built. The `aarch64-apple-darwin` archive is unverified until the first tag builds it.
 
 ## Development

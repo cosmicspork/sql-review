@@ -227,12 +227,72 @@ impl Plugin {
     fn read_cred(&self, db: &Path) -> Value {
         json!({"DB_BACKEND": "sqlite", "DB_SERVICE": db.display().to_string()})
     }
+
+    /// A context as the node signs it for a call dispatched from an
+    /// approved card: an approval id, and the preview's token if it had one.
+    fn approved(&self, tool: &str, args: &Value, credentials: Value, token: &Value) -> Value {
+        let mut ctx = self.context(tool, args, credentials);
+        ctx["approval_id"] = json!("approval-1");
+        if !token.is_null() {
+            ctx["preview_token"] = token.clone();
+        }
+        self.sign(&mut ctx);
+        ctx
+    }
+
+    /// Both accounts, as the node lends them to an approved write. SQLite
+    /// has no logins: the write account's user only opens it read-write.
+    fn write_creds(&self) -> Value {
+        json!({"sql-read": self.read_cred(&self.db), "sql-write": {"DB_USER": "writer"}})
+    }
+
+    /// `tracon/preview` of `tool`, with a context signed for it.
+    async fn preview(&mut self, tool: &str, args: Value, credentials: Value) -> Value {
+        let ctx = self.context(tool, &args, credentials);
+        self.preview_with(tool, args, Some(ctx)).await
+    }
+
+    async fn preview_with(&mut self, tool: &str, args: Value, ctx: Option<Value>) -> Value {
+        let mut params = json!({"name": tool, "arguments": args});
+        if let Some(ctx) = ctx {
+            params["_meta"] = json!({"tracon": ctx});
+        }
+        self.request("tracon/preview", params).await
+    }
+
+    fn scores(&self) -> Vec<(i64, i64)> {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT app_id, score FROM apps ORDER BY app_id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn execute(&self, sql: &str) {
+        rusqlite::Connection::open(&self.db)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    fn data(&self) -> PathBuf {
+        self._dir.path().join("d")
+    }
 }
 
 /// The JSON-RPC error message, asserting the call was refused.
 fn refused(r: &Value) -> String {
     assert!(r.get("result").is_none(), "expected a refusal, got {r}");
     r["error"]["message"].as_str().unwrap().to_string()
+}
+
+/// A JSON-RPC result, asserting there was one.
+fn result(r: &Value) -> &Value {
+    assert!(r.get("error").is_none(), "expected a result, got {r}");
+    &r["result"]
 }
 
 fn rows(r: &Value) -> Value {
@@ -492,4 +552,319 @@ async fn a_signed_field_this_build_does_not_know_is_accepted() {
     ctx["preview_token"] = json!("{\"count\":1,\"hash\":\"cd34\"}");
     let r = p.call_with("query", args, Some(ctx)).await;
     assert_eq!(r["error"]["data"]["check"], json!(4), "{r}");
+}
+
+#[tokio::test]
+async fn an_update_is_previewed_without_running_and_applied_once_approved() {
+    let mut p = Plugin::start().await;
+    let args = json!({
+        "sql": "UPDATE apps SET score = score + 1 WHERE strm = :strm",
+        "params": {"strm": "1261"},
+    });
+    let r = p
+        .preview(
+            "write",
+            args.clone(),
+            json!({"sql-read": p.read_cred(&p.db)}),
+        )
+        .await;
+    let pv = result(&r);
+    assert_eq!(pv["previewable"], true, "{r}");
+    assert_eq!(
+        pv["summary"],
+        "UPDATE apps SET score = score + 1 WHERE strm = :strm (2 row(s))"
+    );
+    let body = pv["body"].as_str().unwrap();
+    assert!(
+        body.starts_with("```sql\nUPDATE apps SET score = score + 1 WHERE strm = :strm\n```\n"),
+        "{body}"
+    );
+    assert!(body.contains("**2 row(s) would change.**"), "{body}");
+    assert!(body.contains("| app_id | email | score | strm |"), "{body}");
+    assert!(body.contains("| 2 | b@y.net | 30 | 1261 |"), "{body}");
+    let token = pv["token"].clone();
+    let parsed: Value = serde_json::from_str(token.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["count"], 2);
+    assert_eq!(parsed["rows_hash"].as_str().unwrap().len(), 64);
+    // A preview runs nothing and writes nothing, not even the plugin's log.
+    assert_eq!(p.scores(), [(1, 10), (2, 30), (3, 20)]);
+    assert!(!p.data().join("log.jsonl").exists());
+
+    let ctx = p.approved("write", &args, p.write_creds(), &token);
+    let r = p.call_with("write", args, Some(ctx)).await;
+    let done = rows(&r);
+    assert_eq!(done["status"], "approved", "{done}");
+    assert_eq!(done["row_count"], 2);
+    assert_eq!(p.scores(), [(1, 11), (2, 31), (3, 20)]);
+
+    // Recorded in the plugin's data directory, without the credentials.
+    let id = done["proposal_id"].as_str().unwrap();
+    let kept = std::fs::read_to_string(p.data().join(format!("decided/{id}.json"))).unwrap();
+    assert!(kept.contains("\"status\": \"approved\""), "{kept}");
+    let log = std::fs::read_to_string(p.data().join("log.jsonl")).unwrap();
+    assert!(log.contains("\"event\":\"approved\""), "{log}");
+    assert!(!log.contains("writer"), "{log}");
+}
+
+#[tokio::test]
+async fn a_change_between_preview_and_apply_is_refused_as_stale() {
+    let mut p = Plugin::start().await;
+    let args = json!({"sql": "UPDATE apps SET score = 0 WHERE strm = '1261'"});
+    let r = p
+        .preview(
+            "write",
+            args.clone(),
+            json!({"sql-read": p.read_cred(&p.db)}),
+        )
+        .await;
+    let token = result(&r)["token"].clone();
+    // Someone else edits a row the card showed.
+    p.execute("UPDATE apps SET email = 'new@y.net' WHERE app_id = 2");
+
+    let ctx = p.approved("write", &args, p.write_creds(), &token);
+    let r = p.call_with("write", args.clone(), Some(ctx)).await;
+    assert_eq!(r["error"]["code"], -32002, "{r}");
+    assert_eq!(r["error"]["data"], json!({"stale": true}));
+    assert!(refused(&r).contains("moved since it was proposed"), "{r}");
+    assert_eq!(p.scores(), [(1, 10), (2, 30), (3, 20)]);
+
+    // A new row the WHERE now selects is stale too, by count.
+    let r = p
+        .preview(
+            "write",
+            args.clone(),
+            json!({"sql-read": p.read_cred(&p.db)}),
+        )
+        .await;
+    let token = result(&r)["token"].clone();
+    p.execute("UPDATE apps SET strm = '1261' WHERE app_id = 3");
+    let ctx = p.approved("write", &args, p.write_creds(), &token);
+    let r = p.call_with("write", args, Some(ctx)).await;
+    assert_eq!(r["error"]["data"]["stale"], true, "{r}");
+    assert!(refused(&r).contains("selects 3 row(s) now, 2 then"), "{r}");
+    assert_eq!(p.scores(), [(1, 10), (2, 30), (3, 20)]);
+}
+
+#[tokio::test]
+async fn an_alter_is_not_previewable_and_applies_once_approved() {
+    let mut p = Plugin::start().await;
+    let columns = |db: &Path| -> i64 {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .query_row("SELECT count(*) FROM pragma_table_info('apps')", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let args = json!({"sql": "ALTER TABLE apps ADD COLUMN note TEXT"});
+    let r = p
+        .preview(
+            "write",
+            args.clone(),
+            json!({"sql-read": p.read_cred(&p.db)}),
+        )
+        .await;
+    let pv = result(&r);
+    assert_eq!(pv["previewable"], false, "{r}");
+    assert_eq!(pv["token"], Value::Null);
+    assert_eq!(
+        pv["summary"],
+        "ALTER TABLE apps ADD COLUMN note TEXT (not previewable)"
+    );
+    let body = pv["body"].as_str().unwrap();
+    assert!(
+        body.contains("ALTER TABLE apps ADD COLUMN note TEXT"),
+        "{body}"
+    );
+    assert!(body.contains("**Not previewable:** ALTER is DDL"), "{body}");
+    assert_eq!(columns(&p.db), 4, "never run to preview it");
+
+    let ctx = p.approved("write", &args, p.write_creds(), &Value::Null);
+    let r = p.call_with("write", args, Some(ctx)).await;
+    assert_eq!(rows(&r)["status"], "approved", "{r}");
+    assert_eq!(columns(&p.db), 5);
+}
+
+#[tokio::test]
+async fn a_write_without_an_approval_is_refused() {
+    let mut p = Plugin::start().await;
+    let args = json!({"sql": "DELETE FROM apps"});
+    // Even with sql-write lent, as the node never would without an approval.
+    let ctx = p.context("write", &args, p.write_creds());
+    let r = p.call_with("write", args, Some(ctx)).await;
+    assert_eq!(r["error"]["data"]["check"], 7, "{r}");
+    assert!(refused(&r).contains("check 7 failed"), "{r}");
+    assert_eq!(common::count(&p.db), 3);
+}
+
+#[tokio::test]
+async fn a_preview_never_touches_sql_write() {
+    let mut p = Plugin::start().await;
+    // A database file nobody may write: a preview that ran the statement,
+    // or opened it for writing, would fail.
+    let mut perms = std::fs::metadata(&p.db).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
+    std::fs::set_permissions(&p.db, perms).unwrap();
+    // And an sql-write that can't even be resolved, lent as the node never
+    // would lend it to a preview.
+    let creds = json!({
+        "sql-read": p.read_cred(&p.db),
+        "sql-write": {"DB_BACKEND": "nope", "DB_USER": "writer"},
+    });
+    let args = json!({"sql": "DELETE FROM apps WHERE strm = '1261'"});
+    let r = p.preview("write", args.clone(), creds).await;
+    let pv = result(&r);
+    assert_eq!(pv["previewable"], true, "{r}");
+    assert_eq!(common::count(&p.db), 3);
+
+    // With only sql-write lent, a preview has nothing to read with.
+    let r = p
+        .preview("write", args, json!({"sql-write": p.read_cred(&p.db)}))
+        .await;
+    assert_eq!(r["error"]["code"], -32003, "{r}");
+    assert!(
+        refused(&r).contains("no sql-read credential was lent"),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_write_sent_through_query_still_runs_read_only_and_fails() {
+    let mut p = Plugin::start().await;
+    // Approved, with sql-write lent and a token: query still reads only.
+    let args = json!({"sql": "UPDATE apps SET score = 0"});
+    let token = json!(format!(
+        "{{\"count\":3,\"rows_hash\":\"{}\"}}",
+        "0".repeat(64)
+    ));
+    let ctx = p.approved("query", &args, p.write_creds(), &token);
+    let r = p.call_with("query", args, Some(ctx)).await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("this statement writes"),
+        "{r}"
+    );
+    // Past the classifier, the settings a plugin call reads with are the
+    // read-only connection's, and it refuses the write.
+    let creds: std::collections::BTreeMap<String, String> =
+        serde_json::from_value(p.read_cred(&p.db)).unwrap();
+    let cfg = sql_review::config::resolve(
+        &sql_review::config::CredentialSource(creds),
+        sql_review::config::Resolve {
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let e = sql_review::backend::read(&cfg, "UPDATE apps SET score = 0", &Default::default(), 0)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("readonly"), "{e}");
+    assert_eq!(p.scores(), [(1, 10), (2, 30), (3, 20)]);
+}
+
+#[tokio::test]
+async fn reads_preview_as_not_previewable() {
+    let mut p = Plugin::start().await;
+    let creds = json!({"sql-read": p.read_cred(&p.db)});
+    for (tool, args) in [
+        ("query", json!({"sql": "SELECT 1 AS n"})),
+        ("describe", json!({"table": "apps"})),
+    ] {
+        let r = p.preview(tool, args, creds.clone()).await;
+        let pv = result(&r);
+        assert_eq!(pv["previewable"], false, "{r}");
+        assert_eq!(pv["token"], Value::Null);
+        assert_eq!(pv["summary"], format!("{tool} only reads"));
+        assert_eq!(pv["body"].as_str().unwrap().lines().count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn bad_previews_and_tokens_are_refused() {
+    let mut p = Plugin::start().await;
+    let creds = json!({"sql-read": p.read_cred(&p.db)});
+    let args = json!({"sql": "DELETE FROM apps WHERE app_id = 1"});
+
+    // The preview's context goes through the same checks, except 7.
+    let r = p.preview_with("write", args.clone(), None).await;
+    assert!(refused(&r).contains("no Tracon caller context"), "{r}");
+    let mut ctx = p.context("write", &args, creds.clone());
+    ctx["channel"] = json!("other");
+    let r = p.preview_with("write", args.clone(), Some(ctx)).await;
+    assert_eq!(r["error"]["data"]["check"], 4, "{r}");
+    let r = p.preview("drop_everything", json!({}), creds.clone()).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let r = p
+        .preview("write", json!({"sql": "SELECT 1"}), creds.clone())
+        .await;
+    assert_eq!(r["error"]["code"], -32003, "{r}");
+    assert!(refused(&r).contains("only reads"), "{r}");
+    let r = p.request("tracon/nothing", json!({})).await;
+    assert_eq!(r["error"]["code"], -32601, "{r}");
+
+    // A token that isn't ours is a malformed call, and nothing runs.
+    for token in [
+        json!("{\"WRK-1\":\"2026-11-16T09:12:33.000+0000\"}"),
+        json!("not json"),
+    ] {
+        let ctx = p.approved("write", &args, p.write_creds(), &token);
+        let r = p.call_with("write", args.clone(), Some(ctx)).await;
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    // A token for a statement that has no rows to check is malformed too.
+    let alter = json!({"sql": "ALTER TABLE apps ADD COLUMN x TEXT"});
+    let token = json!(format!(
+        "{{\"count\":0,\"rows_hash\":\"{}\"}}",
+        "0".repeat(64)
+    ));
+    let ctx = p.approved("write", &alter, p.write_creds(), &token);
+    let r = p.call_with("write", alter, Some(ctx)).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert_eq!(common::count(&p.db), 3);
+}
+
+#[tokio::test]
+async fn an_approved_write_needs_the_write_account_for_the_same_database() {
+    let mut p = Plugin::start().await;
+    let args = json!({"sql": "DELETE FROM apps WHERE app_id = 1"});
+    let text = |r: &Value| {
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let ctx = p.approved(
+        "write",
+        &args,
+        json!({"sql-read": p.read_cred(&p.db)}),
+        &Value::Null,
+    );
+    let r = p.call_with("write", args.clone(), Some(ctx)).await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(
+        text(&r).contains("credential sql-write was not lent"),
+        "{r}"
+    );
+
+    let creds = json!({"sql-read": p.read_cred(&p.db), "sql-write": p.read_cred(&p.qa)});
+    let ctx = p.approved("write", &args, creds, &Value::Null);
+    let r = p.call_with("write", args.clone(), Some(ctx)).await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(text(&r).contains("names sqlite://"), "{r}");
+    assert_eq!(common::count(&p.db), 3);
+    assert_eq!(common::count(&p.qa), 1);
+
+    // A profile's write account is sql-write-<profile>.
+    let qa = json!({"sql": "DELETE FROM apps WHERE app_id = 1", "profile": "qa"});
+    let creds = json!({"sql-read-qa": p.read_cred(&p.qa), "sql-write-qa": {"DB_USER": "w"}});
+    let ctx = p.approved("write", &qa, creds, &Value::Null);
+    let r = p.call_with("write", qa, Some(ctx)).await;
+    assert_eq!(rows(&r)["row_count"], 1, "{r}");
+    assert_eq!(common::count(&p.qa), 0);
+    assert_eq!(common::count(&p.db), 3);
 }

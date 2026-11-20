@@ -129,6 +129,14 @@ impl Store {
         Ok(p)
     }
 
+    /// Keep a proposal that was decided as it was made: a plugin `write`,
+    /// whose review was the node's approval card.
+    pub fn record(&self, p: &Proposal) -> Result<(), String> {
+        self.write(Place::Decided, p)?;
+        self.log_decided(p);
+        Ok(())
+    }
+
     /// Record a proposal written to a file of its own.
     pub fn log_proposed(&self, p: &Proposal) {
         self.log(json!({

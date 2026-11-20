@@ -1,12 +1,15 @@
-//! The `query` and `describe` tools, served over MCP, and standalone, the
-//! `write` and `proposal_status` tools.
+//! The `query`, `describe` and `write` tools, served over MCP, and
+//! standalone, `proposal_status`.
 //!
 //! One handler serves both modes. Standalone (`sql-review mcp`), settings
 //! come from the environment and `.env`, read again on each call, and a
 //! write is proposed into the store for a person to decide with `sql-review
 //! review`. As a Tracon plugin (`sql-review serve`), every call must pass
-//! the caller context checks first, its settings come only from the
-//! credentials lent to that call, and there is no write tool yet.
+//! the caller context checks first, and its settings come only from the
+//! credentials lent to that call. There the node's approval card is the
+//! review: `tracon/preview` answers with the proposal, read on the
+//! read-only account without running the write, and an approved `write`
+//! is applied on the `sql-write` account against the preview's token.
 
 use std::{
     collections::BTreeMap,
@@ -18,16 +21,17 @@ use std::{
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CustomRequest,
+        CustomResult, ErrorCode, Implementation, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
 };
 use serde_json::{Map, Value, json};
 
 use crate::{
-    change,
-    config::{self, CredentialSource, DEFAULT_PROFILE, EnvSource, Resolve},
+    change::{self, ApplyError, Outcome, Preview, Proposal, Shape, Token},
+    config::{self, Account, CredentialSource, DEFAULT_PROFILE, EnvSource, Resolve},
     contract::{Caller, Verifier},
     run::{self, Request},
     store::{Place, Store},
@@ -46,11 +50,33 @@ pub const MAX_WAIT_SECS: u64 = 45;
 /// profile, `sql-read-<profile>` for another.
 pub const READ_CREDENTIAL: &str = "sql-read";
 
+/// The credential an approved plugin `write` applies with: `sql-write` for
+/// the default profile, `sql-write-<profile>` for another. The node lends it
+/// only to a call dispatched from an approved card (`lend = "approved"`).
+pub const WRITE_CREDENTIAL: &str = "sql-write";
+
+/// The JSON-RPC method the node sends when an approval card opens.
+pub const PREVIEW_METHOD: &str = "tracon/preview";
+
+/// An approved write refused because its rows moved since the preview; its
+/// `data` is `{"stale": true}`, which is what the node keys on.
+pub const STALE: i32 = -32002;
+
+/// A preview that could not be taken: the reason is shown on the card.
+pub const NOT_PREVIEWED: i32 = -32003;
+
 /// Where a call's settings come from.
 #[derive(Clone)]
 pub enum Mode {
     Standalone(Standalone),
-    Plugin(Arc<Verifier>),
+    Plugin(Arc<Plugin>),
+}
+
+/// `sql-review serve`: the node's checks, and where applied writes are
+/// recorded (the plugin's data directory).
+pub struct Plugin {
+    pub verifier: Verifier,
+    pub store: Option<Store>,
 }
 
 #[derive(Clone)]
@@ -223,6 +249,235 @@ impl Handler {
             .map(|rs| rs.to_tool_json())
             .map_err(|e| e.to_string())
     }
+
+    /// An approved plugin `write`: applied on the lent `sql-write` account,
+    /// against the preview's token when it has one.
+    async fn apply_approved(
+        &self,
+        plugin: &Plugin,
+        args: &Map<String, Value>,
+        credentials: &BTreeMap<String, BTreeMap<String, String>>,
+        preview_token: Option<&str>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // A token that isn't ours is a malformed call, refused before any
+        // credential is looked at.
+        let token = preview_token
+            .map(|t| t.parse::<Token>())
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let tool_error = |e: String| Ok(CallToolResult::error(vec![ContentBlock::text(e)]));
+        let (sql, params, profile) = match write_args(args) {
+            Ok(a) => a,
+            Err(e) => return tool_error(e),
+        };
+        let cfg = match self.config_for(profile, credentials) {
+            Ok(cfg) => cfg,
+            Err(e) => return tool_error(e),
+        };
+        let account = match write_account_lent(&cfg, credentials) {
+            Ok(a) => a,
+            Err(e) => return tool_error(e),
+        };
+        let cfg = config::Config {
+            write: Some(account),
+            read_only: false,
+            ..cfg
+        };
+        let statement = change::normalize(sql);
+        let shape = match change::shape(&statement, cfg.backend.dialect()) {
+            Ok(s) => s,
+            Err(e) => return tool_error(e),
+        };
+        let preview = match (token, &shape) {
+            (Some(t), Shape::Rows { .. }) => Preview {
+                kind: change::PreviewKind::Rows,
+                note: None,
+                affected_query: None,
+                row_count: Some(t.count),
+                rows_hash: Some(t.rows_hash),
+                sample: None,
+            },
+            (Some(_), Shape::NotPreviewable(_)) => {
+                return Err(ErrorData::invalid_params(
+                    "preview_token does not fit this statement: only a single-table UPDATE \
+                     or DELETE is previewed with one",
+                    None,
+                ));
+            }
+            (None, _) => Preview::not_previewable(
+                "approved without a preview token, so it runs as written and nothing checks \
+                 what it changes",
+            ),
+        };
+        let mut p = Proposal::new(&cfg, statement, &params, preview);
+        let applied = change::apply(&p, &cfg).await;
+        p.outcome = Some(Outcome::of(&applied));
+        if let Some(store) = &plugin.store
+            && let Err(e) = store.record(&p)
+        {
+            eprintln!("sql-review: could not record {}: {e}", p.id);
+        }
+        match applied {
+            Ok(n) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                json!({
+                    "proposal_id": p.id,
+                    "status": "approved",
+                    "row_count": n,
+                    "checked": if p.preview.kind == change::PreviewKind::Rows {
+                        "the rows' count and hash matched the preview"
+                    } else {
+                        "nothing: not previewable"
+                    },
+                })
+                .to_string(),
+            )])),
+            Err(e @ ApplyError::Stale(_)) => Err(ErrorData::new(
+                ErrorCode(STALE),
+                e.to_string(),
+                Some(json!({ "stale": true })),
+            )),
+            Err(e) => tool_error(format!("nothing was committed: {e}")),
+        }
+    }
+
+    /// `tracon/preview`: what a call would do, without doing it. A write is
+    /// proposed on the read-only account and never run; `sql-write` is not
+    /// read even if it were lent.
+    async fn preview(
+        &self,
+        plugin: &Plugin,
+        params: &Map<String, Value>,
+        meta: Option<&Value>,
+    ) -> Result<Value, ErrorData> {
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ErrorData::invalid_params("tracon/preview needs a tool name", None))?;
+        if ![QUERY, DESCRIBE, WRITE].contains(&name) {
+            return Err(ErrorData::invalid_params(format!("no tool {name:?}"), None));
+        }
+        let arguments = match params.get("arguments") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(m)) => Some(m),
+            Some(_) => {
+                return Err(ErrorData::invalid_params(
+                    "tracon/preview arguments must be an object",
+                    None,
+                ));
+            }
+        };
+        let meta = meta.ok_or_else(|| {
+            ErrorData::invalid_request("this preview carries no Tracon caller context", None)
+        })?;
+        let verified = plugin
+            .verifier
+            .verify_preview(meta, name, arguments, now_ms())
+            .map_err(|e| {
+                eprintln!("sql-review: refused a preview of {name}: {e}");
+                ErrorData::invalid_request(e.to_string(), Some(json!({"check": e.check()})))
+            })?;
+        if name != WRITE {
+            return Ok(json!({
+                "previewable": false,
+                "summary": format!("{name} only reads"),
+                "body": format!("`{name}` reads on the read-only account and changes nothing."),
+                "token": null,
+            }));
+        }
+        let empty = Map::new();
+        let args = arguments.unwrap_or(&empty);
+        let (sql, sql_params, profile) =
+            write_args(args).map_err(|e| ErrorData::invalid_params(e, None))?;
+        let refused = |e: String| ErrorData::new(ErrorCode(NOT_PREVIEWED), e, None);
+        let cfg = self
+            .config_for(profile, &verified.credentials)
+            .map_err(refused)?;
+        let p = change::propose(&cfg, sql, &sql_params)
+            .await
+            .map_err(refused)?;
+        Ok(preview_of(&p))
+    }
+}
+
+/// A proposal as `tracon/preview` answers it.
+pub fn preview_of(p: &Proposal) -> Value {
+    json!({
+        "previewable": p.preview.kind == change::PreviewKind::Rows,
+        "summary": p.title(),
+        "body": change::render_markdown(p),
+        "token": p.token(),
+    })
+}
+
+/// A write's `sql`, `params` and `profile`.
+fn write_args(args: &Map<String, Value>) -> Result<(&str, Params, Option<&str>), String> {
+    let sql = args
+        .get("sql")
+        .and_then(Value::as_str)
+        .ok_or("write needs sql")?;
+    let profile = match args.get("profile") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Err("profile must be a string".into()),
+    };
+    Ok((sql, params_of(args)?, profile))
+}
+
+/// The write account lent for `cfg`'s profile. Its fields are the same
+/// `DB_*` keys as `sql-read`'s: `DB_USER` and `DB_PASSWORD` (or a
+/// `DATABASE_URL`'s login) are the write account. Connection fields it
+/// leaves out are `sql-read`'s; any it gives must name the same database.
+pub fn write_account_lent(
+    cfg: &config::Config,
+    credentials: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<Account, String> {
+    let profile = cfg.profile.as_deref().unwrap_or(DEFAULT_PROFILE);
+    let name = if profile == DEFAULT_PROFILE {
+        WRITE_CREDENTIAL.to_string()
+    } else {
+        format!("{WRITE_CREDENTIAL}-{profile}")
+    };
+    let fields = credentials.get(&name).ok_or_else(|| {
+        format!("credential {name} was not lent to this call; it is lent only to an approved write")
+    })?;
+    let get = |k: &str| fields.get(k).filter(|v| !v.is_empty()).cloned();
+    const CONNECTION: [&str; 7] = [
+        "DB_BACKEND",
+        "DB_HOST",
+        "DB_PORT",
+        "DB_SERVICE",
+        "DB_DATABASE",
+        "DB_SCHEMA",
+        "DATABASE_URL",
+    ];
+    if CONNECTION.iter().any(|k| get(k).is_some()) {
+        let w = config::resolve(
+            &CredentialSource(fields.clone()),
+            Resolve {
+                profile: Some(profile),
+                prefixed: false,
+                read_only: true,
+                env_path: None,
+            },
+        )
+        .map_err(|e| format!("credential {name}: {e}"))?;
+        if w.target() != cfg.target() {
+            return Err(format!(
+                "credential {name} names {}, not {}, the database {} reads",
+                w.target(),
+                cfg.target(),
+                credential_name(profile)
+            ));
+        }
+        return Ok(w.account());
+    }
+    let user = get("DB_USER")
+        .or_else(|| get("DB_USERNAME"))
+        .ok_or_else(|| format!("credential {name} has no DB_USER"))?;
+    Ok(Account {
+        user,
+        password: get("DB_PASSWORD"),
+    })
 }
 
 fn params_of(args: &Map<String, Value>) -> Result<Params, String> {
@@ -280,11 +535,11 @@ pub fn write_definitions(profiles: &[String]) -> Vec<Value> {
     let mut write = json!({
         "name": WRITE,
         "description": "Propose one write (INSERT, UPDATE, DELETE, MERGE, or DDL) for a person to \
-                        review. Nothing is written yet: the statement is previewed on the write \
-                        account in a transaction that is rolled back, showing the rows it would \
-                        change, and returns a proposal_id. A person approves or rejects it with \
-                        `sql-review review`; wait for that with proposal_status. DDL and procedure \
-                        calls are never run at preview and show as not previewable.",
+                        review, and return a proposal_id. Nothing is run yet, not even to preview \
+                        it: for a single-table UPDATE or DELETE the proposal shows the rows its \
+                        WHERE selects now, read on the read-only account; anything else shows as \
+                        the statement alone, not previewable. A person approves or rejects it with \
+                        `sql-review review`; wait for that with proposal_status.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -329,6 +584,36 @@ pub fn write_definitions(profiles: &[String]) -> Vec<Value> {
             "annotations": { "readOnlyHint": true },
         }),
     ]
+}
+
+/// The plugin's `write` tool. The node's approval card is the review.
+pub fn plugin_write_definition() -> Value {
+    json!({
+        "name": WRITE,
+        "description": "Write to the database: one INSERT, UPDATE, DELETE, MERGE, DDL statement or \
+                        procedure call. It runs only once the operator approves it on a card, on \
+                        the write account, in one transaction. Nothing is run to preview it: for a \
+                        single-table UPDATE or DELETE the card shows the rows its WHERE selects \
+                        now, read on the read-only account, and the write is refused as stale if \
+                        those rows change before it commits (call again for a fresh card). \
+                        Anything else shows as the statement alone, not previewable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sql": { "type": "string", "description": "One write statement." },
+                "params": {
+                    "type": "object",
+                    "description": "Bind values for :name placeholders: strings, integers, booleans or null. Pass decimals as strings.",
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Which database connection to use. Default: the default profile, or the only one.",
+                },
+            },
+            "required": ["sql"],
+        },
+        "annotations": { "readOnlyHint": false, "destructiveHint": true },
+    })
 }
 
 /// The profiles a call's credentials lend: `sql-read` is `default`,
@@ -449,7 +734,11 @@ fn now_ms() -> i64 {
 
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        let instructions = if self.store().is_some() {
+        let instructions = if matches!(self.mode, Mode::Plugin(_)) {
+            "SQL. `query` runs one read; `describe` lists a table's columns; a write sent to \
+             `query` is refused. `write` runs one write once the operator approves it on a card; \
+             for a single-table UPDATE or DELETE the card shows the rows it will change."
+        } else if self.store().is_some() {
             "SQL. `query` runs one read; `describe` lists a table's columns; a write sent to \
              `query` is refused. `write` proposes a write for a person to review with \
              `sql-review review`, and `proposal_status` waits for their decision."
@@ -468,7 +757,9 @@ impl ServerHandler for Handler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let mut defs = definitions(self.profiles());
-        if self.store().is_some() {
+        if matches!(self.mode, Mode::Plugin(_)) {
+            defs.push(plugin_write_definition());
+        } else if self.store().is_some() {
             defs.extend(write_definitions(self.profiles().unwrap_or_default()));
         }
         let tools = defs
@@ -486,9 +777,9 @@ impl ServerHandler for Handler {
     ) -> Result<CallToolResponse, ErrorData> {
         let tool = request.name.to_string();
         let args = request.arguments.clone().unwrap_or_default();
-        let (credentials, caller) = match &self.mode {
-            Mode::Standalone(_) => (BTreeMap::new(), None),
-            Mode::Plugin(verifier) => {
+        let (credentials, caller, preview_token) = match &self.mode {
+            Mode::Standalone(_) => (BTreeMap::new(), None, None),
+            Mode::Plugin(plugin) => {
                 // The checks run before any tool code, and a refusal is a
                 // protocol error, not a tool result.
                 let meta = context
@@ -503,7 +794,8 @@ impl ServerHandler for Handler {
                             None,
                         )
                     })?;
-                let verified = verifier
+                let verified = plugin
+                    .verifier
                     .verify(meta, &tool, request.arguments.as_ref(), now_ms())
                     .map_err(|e| {
                         eprintln!("sql-review: refused a call to {tool}: {e}");
@@ -516,9 +808,21 @@ impl ServerHandler for Handler {
                     c.session.as_deref().unwrap_or("-"),
                     c.channel
                 );
-                (verified.credentials, Some(verified.caller))
+                (
+                    verified.credentials,
+                    Some(verified.caller),
+                    verified.preview_token,
+                )
             }
         };
+        if let Mode::Plugin(plugin) = &self.mode
+            && tool == WRITE
+        {
+            return self
+                .apply_approved(plugin, &args, &credentials, preview_token.as_deref())
+                .await
+                .map(Into::into);
+        }
         let writes = self.store().is_some() && (tool == WRITE || tool == PROPOSAL_STATUS);
         if tool != QUERY && tool != DESCRIBE && !writes {
             return Err(ErrorData::invalid_params(format!("no tool {tool:?}"), None));
@@ -529,6 +833,45 @@ impl ServerHandler for Handler {
             Err(e) => CallToolResult::error(vec![ContentBlock::text(e)]),
         };
         Ok(result.into())
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        let Mode::Plugin(plugin) = &self.mode else {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            ));
+        };
+        if request.method != PREVIEW_METHOD {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            ));
+        }
+        let params = match &request.params {
+            Some(Value::Object(m)) => m.clone(),
+            None | Some(Value::Null) => Map::new(),
+            Some(_) => {
+                return Err(ErrorData::invalid_params(
+                    "tracon/preview params must be an object",
+                    None,
+                ));
+            }
+        };
+        // rmcp moves `params._meta` into the request context.
+        let meta = context
+            .meta
+            .0
+            .0
+            .get("tracon")
+            .or_else(|| params.get("_meta").and_then(|m| m.get("tracon")));
+        self.preview(plugin, &params, meta).await.map(CustomResult)
     }
 }
 

@@ -230,7 +230,7 @@ fn a_write_waits_for_review_in_a_terminal() {
     assert_eq!(r["status"], "pending");
     assert_eq!(r["row_count"], 2);
     assert_eq!(r["previewable"], true);
-    assert!(r["preview"].as_str().unwrap().contains("before"), "{r}");
+    assert!(r["preview"].as_str().unwrap().contains("rows now"), "{r}");
     let id = r["proposal_id"].as_str().unwrap().to_string();
     assert_eq!(common::count(&db), 3, "only proposed");
 
