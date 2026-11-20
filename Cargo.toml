@@ -13,7 +13,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
 dotenvy = "0.15"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"
 oracledb = "=26.0.0-beta.6"
@@ -22,7 +22,7 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 sqlparser = "0.64"
 thiserror = "2"
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73", "chrono"] }
@@ -35,9 +35,9 @@ uuid = { version = "1", features = ["v7"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-rand = "0.8"
+rand = "0.10"
 tempfile = "3"
-toml = "0.9"
+toml = "1.2"
 
 [profile.release]
 strip = true
