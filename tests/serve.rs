@@ -13,7 +13,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, body::Bytes};
 use hyper_util::rt::TokioIo;
-use rand::RngCore;
+use rand::Rng;
 use serde_json::{Value, json};
 use sql_review::contract::{arguments_sha256, sha256_hex, signing_bytes};
 
@@ -46,7 +46,7 @@ fn now_ms() -> i64 {
 
 fn nonce() -> String {
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     hex::encode(b)
 }
 
@@ -66,7 +66,7 @@ impl Plugin {
         )
         .unwrap();
         let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         let key = SigningKey::from_bytes(&seed);
         let socket = dir.path().join("s.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_sql-review"))
