@@ -15,8 +15,9 @@ egress = []
 name = "sql-read"
 pattern = "sql-read-*"
 
-# Write account, for writes approved through review. Declared now; `serve`
-# reads it only once it offers a write tool, which it doesn't yet.
+# Write account, lent only to a `write` dispatched from an approved card.
+# Same DB_* fields: DB_USER/DB_PASSWORD are the write account; connection
+# fields left out are sql-read's, and any given must name the same database.
 [[credential]]
 name = "sql-write"
 pattern = "sql-write-*"
@@ -29,3 +30,10 @@ hint = "read"
 [[tool]]
 name = "describe"
 hint = "read"
+
+# Previewed on the read-only account without running it; applied on
+# sql-write only once approved, refused as stale if its rows moved.
+[[tool]]
+name = "write"
+hint = "write"
+consequential = true

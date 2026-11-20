@@ -1,9 +1,12 @@
-//! sql-review: read-only SQL for people and agents.
+//! sql-review: read-only SQL for people and agents, with writes proposed
+//! for review.
 //!
 //! One binary, three modes: a CLI ([`cli`]), an MCP server on stdio
 //! ([`mcp`]), and the Tracon plugin contract on a Unix socket ([`serve`]).
-//! The database account is the boundary: reads run on the read-only
-//! account, and the classifier ([`classify`]) only sorts reads from writes.
+//! The database account is the boundary: reads, and the reads that preview
+//! a write, run on the read-only account; the write account is used only
+//! to apply an approved write. The classifier ([`classify`]) only sorts
+//! reads from writes.
 
 pub mod backend;
 pub mod change;
@@ -26,4 +29,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PLUGIN_NAME: &str = "sql-review";
 
 /// The tools and their hints, as `tracon-plugin.toml` declares them.
-pub const TOOLS: &[(&str, &str)] = &[(mcp::QUERY, "read"), (mcp::DESCRIBE, "read")];
+pub const TOOLS: &[(&str, &str)] = &[
+    (mcp::QUERY, "read"),
+    (mcp::DESCRIBE, "read"),
+    (mcp::WRITE, "write"),
+];

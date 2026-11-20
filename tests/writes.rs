@@ -1,6 +1,7 @@
 //! Proposed writes end to end, in process, against SQLite: propose, show,
 //! apply and review from the CLI, and the rows-moved, not-previewable and
-//! read-only-connection cases.
+//! read-only-connection cases. A proposal never runs the write: it reads
+//! the rows on the read-only connection.
 
 mod common;
 
@@ -150,11 +151,13 @@ async fn an_update_previews_its_rows_and_applies() {
         .await;
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(r.stdout.contains("2 row(s) would change"), "{}", r.stdout);
-    assert!(r.stdout.contains("before:") && r.stdout.contains("after:"));
-    // Previewed and rolled back: nothing changed.
+    assert!(r.stdout.contains("rows now:"), "{}", r.stdout);
+    assert!(!r.stdout.contains("after"), "{}", r.stdout);
+    // Read, never run: nothing changed.
     assert_eq!(f.scores(), [(1, 10), (2, 30), (3, 20)]);
 
     let p = f.read("bump");
+    assert_eq!(p["sql_review"], 2);
     assert_eq!(
         p["statement"],
         "UPDATE apps SET score = score + 1 WHERE strm = :strm"
@@ -172,20 +175,16 @@ async fn an_update_previews_its_rows_and_applies() {
         "SELECT * FROM apps WHERE strm = :strm"
     );
     assert_eq!(pv["rows_hash"].as_str().unwrap().len(), 64);
-    assert_eq!(pv["before"]["columns"][2], "score");
-    let scores = |s: &Value| -> Vec<i64> {
-        s["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r[2].as_i64().unwrap())
-            .collect()
-    };
-    let mut before = scores(&pv["before"]);
-    let mut after = scores(&pv["after"]);
-    before.sort();
-    after.sort();
-    assert_eq!((before, after), (vec![10, 30], vec![11, 31]));
+    assert_eq!(pv["sample"]["columns"][2], "score");
+    let mut now: Vec<i64> = pv["sample"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[2].as_i64().unwrap())
+        .collect();
+    now.sort();
+    assert_eq!(now, [10, 30]);
+    assert!(pv.get("after").is_none() && pv.get("before").is_none());
 
     let shown = f.cli(&["show", "bump.json"]).await;
     assert_eq!(shown.code, 0, "{}", shown.stderr);
@@ -253,24 +252,47 @@ async fn a_change_to_the_rows_after_propose_makes_apply_refuse_as_stale() {
     assert_eq!(r.code, 3, "{}", r.stderr);
     assert_eq!(common::count(&f.db), 4);
 
-    // An insert has no prior rows; its row count is still checked.
-    let p = f
-        .propose(
-            "INSERT INTO apps SELECT * FROM apps WHERE strm = '1261'",
-            "copy",
-        )
-        .await;
-    assert_eq!(p["preview"]["kind"], "insert");
-    assert_eq!(p["preview"]["row_count"], 2);
-    f.execute("UPDATE apps SET strm = '1261' WHERE app_id = 3");
-    let r = f.cli(&["apply", "copy.json"]).await;
-    assert_eq!(r.code, 3, "{}", r.stderr);
     assert!(
-        r.stderr.contains("changed 3 row(s), not the 2 proposed"),
+        r.stderr.contains("selects 2 row(s) now, 1 then"),
         "{}",
         r.stderr
     );
-    assert_eq!(common::count(&f.db), 4);
+}
+
+/// The count apply checks is the one read on the read-only account at
+/// propose: a proposal file whose count no longer matches the rows is
+/// refused, even with the rows' hash intact.
+#[tokio::test]
+async fn apply_checks_the_count_read_at_propose() {
+    let f = Fixture::new();
+    let mut p = f
+        .propose("UPDATE apps SET score = 0 WHERE strm = '1261'", "zero")
+        .await;
+    assert_eq!(p["preview"]["row_count"], 2);
+    p["preview"]["row_count"] = 3.into();
+    std::fs::write(f.cwd().join("zero.json"), p.to_string()).unwrap();
+    let r = f.cli(&["apply", "zero.json"]).await;
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("selects 2 row(s) now, 3 then"),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(f.scores(), [(1, 10), (2, 30), (3, 20)]);
+}
+
+/// A proposal made by 0.2, which ran the statement to preview it, is not
+/// applied by this build.
+#[tokio::test]
+async fn a_proposal_from_the_old_format_is_refused() {
+    let f = Fixture::new();
+    let mut p = f.propose("DELETE FROM apps WHERE app_id = 1", "old").await;
+    p["sql_review"] = 1.into();
+    std::fs::write(f.cwd().join("old.json"), p.to_string()).unwrap();
+    let r = f.cli(&["apply", "old.json"]).await;
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("propose it again"), "{}", r.stderr);
+    assert_eq!(common::count(&f.db), 3);
 }
 
 #[tokio::test]
@@ -315,52 +337,60 @@ async fn a_write_sent_through_query_fails_on_the_read_only_connection() {
 }
 
 #[tokio::test]
-async fn other_dml_is_counted_only() {
+async fn other_dml_is_not_previewable_and_runs_as_written() {
     let f = Fixture::new();
-    let p = f
-        .propose(
+    for (sql, says) in [
+        (
             "UPDATE apps SET score = 0 WHERE app_id IN (SELECT app_id FROM apps WHERE score > 15)",
-            "sub",
-        )
-        .await;
-    let pv = &p["preview"];
-    assert_eq!(pv["kind"], "count_only");
-    assert_eq!(pv["row_count"], 2);
-    assert!(pv.get("rows_hash").is_none() && pv.get("before").is_none());
-    assert!(pv["note"].as_str().unwrap().contains("subquery"), "{pv}");
-    let r = f.cli(&["apply", "sub.json"]).await;
+            "subquery",
+        ),
+        (
+            "INSERT INTO apps SELECT * FROM apps WHERE strm = '1261'",
+            "INSERT",
+        ),
+    ] {
+        let p = f.propose(sql, "other").await;
+        let pv = &p["preview"];
+        assert_eq!(pv["kind"], "not_previewable", "{sql}");
+        assert!(pv["note"].as_str().unwrap().contains(says), "{pv}");
+        assert!(pv.get("row_count").is_none() && pv.get("sample").is_none());
+        let shown = f.cli(&["show", "other.json"]).await;
+        assert!(
+            shown.stdout.contains("nothing checks what it changes"),
+            "{}",
+            shown.stdout
+        );
+    }
+    assert_eq!(common::count(&f.db), 3, "never run at propose");
+    let r = f.cli(&["apply", "other.json"]).await;
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(f.scores(), [(1, 10), (2, 0), (3, 0)]);
+    assert_eq!(common::count(&f.db), 5);
 
     let p = f
         .propose("DELETE FROM apps WHERE strm = '1265'", "del")
         .await;
     assert_eq!(p["preview"]["kind"], "rows");
-    assert_eq!(p["preview"]["before"]["rows"][0][0], 3);
-    assert!(p["preview"].get("after").is_none());
+    assert_eq!(p["preview"]["sample"]["rows"][0][0], 3);
 }
 
 #[tokio::test]
-async fn a_preview_over_its_time_limit_is_rolled_back_and_not_previewable() {
+async fn reading_the_rows_has_a_time_limit() {
     let mut f = Fixture::new();
     f.set("DB_PREVIEW_TIMEOUT", "0.3");
-    let slow = "UPDATE apps SET score = -1 WHERE (WITH RECURSIVE c(n) AS \
+    let cfg = load_config(f.env_map(), f.cwd(), None, None, false).unwrap();
+    let slow = "SELECT * FROM apps WHERE (WITH RECURSIVE c(n) AS \
                 (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 200000000) \
                 SELECT count(*) FROM c) > 0";
     let started = std::time::Instant::now();
-    let p = f.propose(slow, "slow").await;
+    let read = sql_review::backend::read_rows(&cfg, slow, &Default::default(), cfg.preview_timeout)
+        .await
+        .unwrap();
+    assert!(read.is_none(), "interrupted");
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert_eq!(p["preview"]["kind"], "not_previewable");
-    assert!(
-        p["preview"]["note"].as_str().unwrap().contains("ran over"),
-        "{}",
-        p["preview"]
-    );
-    assert_eq!(f.scores(), [(1, 10), (2, 30), (3, 20)]);
 }
 
 #[tokio::test]
-async fn propose_needs_a_write_account_and_a_write() {
+async fn propose_needs_only_the_read_account() {
     let mut f = Fixture::new();
     let r = f.cli(&["propose", "--sql", "SELECT 1"]).await;
     assert_eq!(r.code, 2);
@@ -369,8 +399,21 @@ async fn propose_needs_a_write_account_and_a_write() {
         .cli(&["propose", "--sql", "DELETE FROM apps; DELETE FROM apps"])
         .await;
     assert!(r.stderr.contains("one at a time"), "{}", r.stderr);
+
+    // No write account, and a database file nobody may write: propose
+    // still reads the rows, because it never opens the file for writing.
     f.unset("DB_WRITE_USER");
-    let r = f.cli(&["propose", "--sql", "DELETE FROM apps"]).await;
+    let mut perms = std::fs::metadata(&f.db).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
+    std::fs::set_permissions(&f.db, perms.clone()).unwrap();
+    let p = f
+        .propose("DELETE FROM apps WHERE strm = '1261'", "del")
+        .await;
+    assert_eq!(p["preview"]["row_count"], 2);
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+    std::fs::set_permissions(&f.db, perms).unwrap();
+
+    let r = f.cli(&["apply", "del.json"]).await;
     assert_eq!(r.code, 2);
     assert!(
         r.stderr

@@ -49,12 +49,14 @@ pub enum Command {
     /// Check an Oracle profile step by step: connect, query, describe,
     /// read-only transaction, binds.
     CheckOracle(CheckOracleArgs),
-    /// Propose a write: preview it on the write account, roll back, and
-    /// write a proposal file.
+    /// Propose a write without running it: read the rows it would change on
+    /// the read-only account (a single-table UPDATE or DELETE), and write a
+    /// proposal file.
     Propose(ProposeArgs),
     /// Show a proposal file, or a stored proposal by id.
     Show(ShowArgs),
-    /// Apply a proposal, refused if its rows moved since it was proposed.
+    /// Apply a proposal on the write account, refused if its rows moved since
+    /// it was proposed.
     Apply(ApplyArgs),
     /// Approve or reject the proposals `mcp` is waiting on.
     Review(ReviewArgs),

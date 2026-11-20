@@ -3,9 +3,11 @@
 //! The driver is blocking, so each read runs on a blocking thread. A read
 //! opens `SET TRANSACTION READ ONLY`, runs, and always rolls back.
 //!
-//! A proposed write runs on the write account with autocommit off: a
-//! preview rolls back under a call timeout, and an apply locks the rows
-//! `FOR UPDATE` before it runs and commits.
+//! A proposal never runs the write: it reads the rows the write would
+//! change on the read-only account, in the same read-only transaction, under
+//! a call timeout. An approved write runs on the write account with
+//! autocommit off: apply locks the rows `FOR UPDATE`, checks them, runs it,
+//! and commits.
 //!
 //! Built and unit-tested here, but not run against an Oracle database:
 //! `sql-review check-oracle` is how an operator verifies reads, and nothing
@@ -16,8 +18,7 @@ use std::time::{Duration, Instant};
 use oracledb::{Connection, Row, ToDbValue};
 
 use super::{
-    ApplyFail, DbError, Expected, Previewed, SyncConn, WritePlan, apply_on, placeholders,
-    preview_on, take_limited,
+    ApplyFail, DbError, Expected, SyncConn, WritePlan, apply_on, placeholders, take_limited,
 };
 use crate::{
     classify::Dialect,
@@ -74,30 +75,24 @@ impl SyncConn for Connection {
     }
 }
 
-pub async fn preview(
+/// The rows a write would change, read on the read-only account inside
+/// `SET TRANSACTION READ ONLY` and rolled back. The driver's call timeout
+/// stops it after `limit`, and that is `None`.
+pub async fn read_rows(
     cfg: &Config,
-    account: &Account,
-    plan: &WritePlan,
-    sample: usize,
+    sql: &str,
+    params: &Params,
     limit: Duration,
-) -> Result<Option<Previewed>, DbError> {
-    let (cfg, account, plan) = (cfg.clone(), account.clone(), plan.clone());
+) -> Result<Option<ResultSet>, DbError> {
+    let (cfg, sql, params) = (cfg.clone(), sql.to_string(), params.clone());
     blocking(move || {
-        let conn = connect_as(&cfg, &account)?;
+        let conn = connect(&cfg)?;
         conn.set_call_timeout(Some(limit))
             .map_err(DbError::connect)?;
         let started = Instant::now();
-        let out = preview_on(&conn, &plan, sample, started + limit);
-        let rolled_back = conn
-            .rollback()
-            .map_err(|e| DbError(format!("rollback failed: {e}")));
-        match out {
+        match read_only(&conn, |conn| read_on(conn, &sql, &params, 0)) {
             Err(_) if started.elapsed() >= limit => Ok(None),
-            out => {
-                let out = out?;
-                rolled_back?;
-                Ok(Some(out))
-            }
+            out => out.map(Some),
         }
     })
     .await

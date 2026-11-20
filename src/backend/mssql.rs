@@ -5,9 +5,11 @@
 //! the connection asks for `ApplicationIntent=ReadOnly`, which matters only
 //! on an availability-group secondary. The read-only login is the boundary.
 //!
-//! A proposed write runs on the write login with `XACT_ABORT ON`: a preview
-//! rolls back, and an apply reads the rows `WITH (UPDLOCK, HOLDLOCK)` before
-//! it runs and commits. Nothing here has run against a server yet.
+//! A proposal never runs the write: it reads the rows the write would
+//! change on the read-only login. An approved write runs on the write login
+//! with `XACT_ABORT ON`: apply reads the rows `WITH (UPDLOCK, HOLDLOCK)`,
+//! checks them, runs it, and commits. Nothing here has run against a server
+//! yet.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use futures_util::TryStreamExt;
@@ -15,9 +17,7 @@ use tiberius::{AuthMethod, Client, ColumnData, EncryptionLevel, FromSql, ToSql};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use super::{
-    ApplyFail, DbError, Expected, Previewed, WritePlan, align, placeholders, split_locator,
-};
+use super::{ApplyFail, DbError, Expected, WritePlan, placeholders};
 use crate::{
     classify::Dialect,
     config::{Account, Config},
@@ -109,65 +109,22 @@ async fn execute(client: &mut Conn, sql: &str, params: &Params) -> Result<u64, D
         .total())
 }
 
-pub async fn preview(
+/// The rows a write would change, read on the read-only login inside a
+/// transaction that is always rolled back, as any read is, but at `READ
+/// COMMITTED`: their hash is what apply checks, so it must not count a
+/// change another session may yet roll back. `None` after `limit`.
+pub async fn read_rows(
     cfg: &Config,
-    account: &Account,
-    plan: &WritePlan,
-    sample: usize,
+    sql: &str,
+    params: &Params,
     limit: std::time::Duration,
-) -> Result<Option<Previewed>, DbError> {
-    let run = async {
-        let mut client = connect_as(cfg, account, false).await?;
-        simple(&mut client, "SET XACT_ABORT ON; BEGIN TRANSACTION").await?;
-        let out = preview_on(&mut client, plan, sample).await;
-        let rolled_back = rollback(&mut client).await;
-        let out = out?;
-        rolled_back?;
-        Ok(out)
-    };
+) -> Result<Option<ResultSet>, DbError> {
     // On timeout the connection is dropped, which ends the session, and SQL
     // Server rolls back its open transaction.
-    match tokio::time::timeout(limit, run).await {
+    match tokio::time::timeout(limit, read_at(cfg, sql, params, 0, "READ COMMITTED")).await {
         Ok(out) => out.map(Some),
         Err(_) => Ok(None),
     }
-}
-
-async fn preview_on(
-    client: &mut Conn,
-    plan: &WritePlan,
-    sample: usize,
-) -> Result<Previewed, DbError> {
-    let mut before = None;
-    let mut found_again = None;
-    if let Some(rows) = &plan.rows {
-        if let Some(located) = &rows.located
-            && let Ok(rs) = select(client, &located.select, &plan.params).await
-        {
-            let (rs, locators) = split_locator(rs, sample);
-            found_again = Some((located.after_prefix.clone(), locators));
-            before = Some(rs);
-        }
-        if before.is_none() {
-            before = Some(select(client, &rows.select, &plan.params).await?);
-        }
-    }
-    let count = execute(client, &plan.statement, &plan.params).await?;
-    let after = match found_again {
-        Some((prefix, locators)) if !locators.is_empty() => {
-            let sql = format!("{prefix}{})", locators.join(", "));
-            Some(align(
-                select(client, &sql, &Params::new()).await?,
-                &locators,
-            ))
-        }
-        _ => None,
-    };
-    Ok(Previewed {
-        before,
-        count,
-        after,
-    })
 }
 
 pub async fn apply(
@@ -207,17 +164,25 @@ pub async fn read(
     params: &Params,
     limit: u64,
 ) -> Result<ResultSet, DbError> {
-    let (sql, values) = bound(sql, params)?;
-
-    let mut client = connect(cfg).await?;
     // consulta's isolation level, so a read never waits on a writer's locks.
-    client
-        .simple_query("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; BEGIN TRANSACTION")
-        .await
-        .map_err(DbError::query)?
-        .into_results()
-        .await
-        .map_err(DbError::query)?;
+    read_at(cfg, sql, params, limit, "READ UNCOMMITTED").await
+}
+
+/// A read on the read-only login at `isolation`, rolled back.
+async fn read_at(
+    cfg: &Config,
+    sql: &str,
+    params: &Params,
+    limit: u64,
+    isolation: &str,
+) -> Result<ResultSet, DbError> {
+    let (sql, values) = bound(sql, params)?;
+    let mut client = connect(cfg).await?;
+    simple(
+        &mut client,
+        &format!("SET TRANSACTION ISOLATION LEVEL {isolation}; BEGIN TRANSACTION"),
+    )
+    .await?;
     let out = read_on(&mut client, &sql, &values, limit).await;
     let rolled_back = rollback(&mut client).await;
     let out = out?;

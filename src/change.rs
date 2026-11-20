@@ -1,15 +1,18 @@
-//! A write as a proposal: what it would change, and a version of the rows
-//! it would change. `propose` runs the statement on the write account in a
-//! transaction and rolls it back; `apply` refuses when those rows moved.
+//! A write as a proposal: the statement, and a version of the rows it
+//! would change. **No write is ever run to preview it**: a rollback is not
+//! reliable everywhere (DDL commits implicitly on Oracle, and sequences,
+//! autonomous-transaction triggers and external effects survive one).
 //!
-//! What a preview can show depends on the statement:
+//! What a proposal can show depends on the statement:
 //!
-//! - a single-table `UPDATE` or `DELETE`: the rows its `WHERE` selects,
-//!   before and (for an update) after, their count, and a hash of them;
-//! - an `INSERT`: the row count (it has no prior rows);
-//! - any other DML (joins, subqueries, `MERGE`): the row count only;
-//! - DDL, procedure calls, blocks, and anything a rollback can't undo: never
-//!   run at propose, shown as the statement alone, "not previewable".
+//! - a single-table `UPDATE` or `DELETE`: a `SELECT` derived from its
+//!   `WHERE`, run on the read-only account, gives the rows as they are now
+//!   (a sample), their count, and a hash of them. `apply` refuses if the
+//!   count or the hash moved, and commits only if the statement changed
+//!   that many rows.
+//! - anything else (`INSERT`, other DML, DDL, procedure calls, blocks): the
+//!   statement alone, "not previewable", with the reason. `apply` runs it as
+//!   written.
 //!
 //! The proposal file is pretty-printed JSON with a fixed key order, so it
 //! can be reviewed in git like any other diff.
@@ -20,33 +23,31 @@ use sqlparser::{
     ast::{FromTable, Statement, TableFactor, TableWithJoins},
     keywords::Keyword,
     parser::Parser,
-    tokenizer::{Token, Tokenizer},
+    tokenizer::{Token as SqlToken, Tokenizer},
 };
 
 use crate::{
-    backend::{self, ApplyFail, Expected, Kind, Located, RowQueries, WritePlan},
+    backend::{self, ApplyFail, Expected, Kind, RowQueries, WritePlan},
     classify::{Classification, Dialect, classify},
     config::Config,
     render::{Format, render as render_rows},
     value::{Cell, Param, Params, ResultSet},
 };
 
-/// The proposal file format this build reads and writes.
-pub const FORMAT: u32 = 1;
+/// The proposal file format this build reads and writes. Format 1 was
+/// written by sql-review 0.2, which ran the statement to preview it.
+pub const FORMAT: u32 = 2;
 
-/// Rows shown before and after; the hash covers every affected row.
+/// Rows shown in a proposal; the hash and count cover every affected row.
 pub const SAMPLE_ROWS: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewKind {
-    /// A single-table UPDATE or DELETE: rows, count and hash.
+    /// A single-table UPDATE or DELETE: rows, count and hash, read on the
+    /// read-only account.
     Rows,
-    /// An INSERT: count only, no prior rows.
-    Insert,
-    /// Other DML: count only.
-    CountOnly,
-    /// Never run at propose.
+    /// The statement alone.
     NotPreviewable,
 }
 
@@ -96,25 +97,36 @@ impl Sample {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preview {
     pub kind: PreviewKind,
-    /// Why it is count-only or not previewable, or what to know about it.
+    /// Why it is not previewable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// The query that found the affected rows.
+    /// The read-only query that found the affected rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affected_query: Option<String>,
-    /// The row count the statement reported, which apply must match.
+    /// How many rows that query found, which the locked rows and the
+    /// statement's own count must both match at apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count: Option<u64>,
     /// The hash of every affected row, which apply must match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows_hash: Option<String>,
-    /// How many rows the affected-row query found (all of them, not the sample).
+    /// The first [`SAMPLE_ROWS`] of them, as they were when proposed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rows_found: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before: Option<Sample>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<Sample>,
+    pub sample: Option<Sample>,
+}
+
+impl Preview {
+    /// The statement alone, and why.
+    pub fn not_previewable(why: impl Into<String>) -> Self {
+        Self {
+            kind: PreviewKind::NotPreviewable,
+            note: Some(why.into()),
+            affected_query: None,
+            row_count: None,
+            rows_hash: None,
+            sample: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,13 +229,62 @@ impl Proposal {
             serde_json::from_str(s).map_err(|e| format!("not a proposal file: {e}"))?;
         if p.sql_review != FORMAT {
             return Err(format!(
-                "proposal format {} is not {FORMAT}, the one this build reads",
+                "proposal format {} is not {FORMAT}, the one this build reads; propose it again",
                 p.sql_review
             ));
         }
         Ok(p)
     }
 
+    /// A new, undecided proposal of `statement` against `cfg`'s database.
+    pub fn new(cfg: &Config, statement: String, params: &Params, preview: Preview) -> Self {
+        let word = first_word(&statement, cfg.backend.dialect()).to_ascii_lowercase();
+        let mut id = format!("{}-{word}", uuid::Uuid::now_v7());
+        id.retain(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        Self {
+            sql_review: FORMAT,
+            id,
+            created: now(),
+            backend: cfg.backend.name().into(),
+            profile: cfg.profile.clone(),
+            target: cfg.target(),
+            statement,
+            params: params
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_json()))
+                .collect(),
+            preview,
+            outcome: None,
+        }
+    }
+
+    /// One line for a card's heading: the statement's first words, and
+    /// what was read of its rows.
+    pub fn title(&self) -> String {
+        match (self.preview.kind, self.preview.row_count) {
+            (PreviewKind::Rows, Some(n)) => format!("{} ({n} row(s))", self.summary()),
+            _ => format!("{} (not previewable)", self.summary()),
+        }
+    }
+
+    /// The version a preview was taken against, as `tracon/preview`'s
+    /// token: the rows' count and hash. `None` when not previewable.
+    pub fn token(&self) -> Option<String> {
+        match (
+            &self.preview.kind,
+            self.preview.row_count,
+            &self.preview.rows_hash,
+        ) {
+            (PreviewKind::Rows, Some(count), Some(hash)) => Some(
+                Token {
+                    count,
+                    rows_hash: hash.clone(),
+                }
+                .to_string(),
+            ),
+            _ => None,
+        }
+    }
     pub fn params(&self) -> Result<Params, String> {
         self.params
             .iter()
@@ -250,6 +311,46 @@ impl Proposal {
     }
 }
 
+/// A preview's token: what an approved write is applied against. On the
+/// wire it is the canonical JSON `{"count":N,"rows_hash":"<sha256 hex>"}`;
+/// the node never reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Token {
+    pub count: u64,
+    pub rows_hash: String,
+}
+
+impl std::fmt::Display for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keys in byte order, so the token is canonical JSON.
+        write!(
+            f,
+            "{{\"count\":{},\"rows_hash\":{}}}",
+            self.count,
+            Value::String(self.rows_hash.clone())
+        )
+    }
+}
+
+impl std::str::FromStr for Token {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || "preview_token is not a row token from this plugin".to_string();
+        let t: Token = serde_json::from_str(s).map_err(|_| bad())?;
+        if t.rows_hash.len() != 64
+            || !t
+                .rows_hash
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(bad());
+        }
+        Ok(t)
+    }
+}
+
 /// An RFC 3339 UTC timestamp, to the second.
 pub fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -258,6 +359,7 @@ pub fn now() -> String {
 /// How a statement can be previewed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
+    /// A single-table UPDATE or DELETE: its rows can be read beforehand.
     Rows {
         delete: bool,
         /// The table, as written.
@@ -266,9 +368,15 @@ pub enum Shape {
         alias: Option<String>,
         filter: Option<String>,
     },
-    Insert,
-    CountOnly(String),
+    /// Anything else, and why.
     NotPreviewable(String),
+}
+
+/// Why DML other than a single-table UPDATE or DELETE has no rows to show.
+fn not_single_table(why: &str) -> Shape {
+    Shape::NotPreviewable(format!(
+        "{why}, so no single-table SELECT can find the rows it changes"
+    ))
 }
 
 /// Read a write's shape. Refuses a read and more than one statement.
@@ -284,7 +392,7 @@ pub fn shape(sql: &str, dialect: Dialect) -> Result<Shape, String> {
         Ok(s) => s,
         Err(_) => {
             return Ok(Shape::NotPreviewable(format!(
-                "{} could not be read as plain DML, so it is never run at propose",
+                "{} could not be read as plain DML, so there are no rows to read beforehand",
                 first_word(sql, dialect)
             )));
         }
@@ -296,13 +404,17 @@ pub fn shape(sql: &str, dialect: Dialect) -> Result<Shape, String> {
         }
     };
     Ok(match statement {
-        Statement::Insert(_) => Shape::Insert,
+        Statement::Insert(_) => Shape::NotPreviewable(
+            "an INSERT adds rows rather than changing rows already there, so there are none to \
+             read beforehand"
+                .into(),
+        ),
         Statement::Update(u) => {
             if u.from.is_some() || !u.table.joins.is_empty() {
-                return Ok(Shape::CountOnly("it joins other tables".into()));
+                return Ok(not_single_table("it joins other tables"));
             }
             if u.limit.is_some() || !u.order_by.is_empty() {
-                return Ok(Shape::CountOnly("ORDER BY or LIMIT picks its rows".into()));
+                return Ok(not_single_table("ORDER BY or LIMIT picks its rows"));
             }
             let set: Vec<String> = u.assignments.iter().map(|a| a.to_string()).collect();
             let filter = u.selection.as_ref().map(|e| e.to_string());
@@ -311,9 +423,7 @@ pub fn shape(sql: &str, dialect: Dialect) -> Result<Shape, String> {
                     .as_deref()
                     .is_some_and(|f| reads_other_tables(f, dialect))
             {
-                return Ok(Shape::CountOnly(
-                    "it reads other tables in a subquery".into(),
-                ));
+                return Ok(not_single_table("it reads other tables in a subquery"));
             }
             match single_table(&u.table) {
                 Some((table, alias)) => Shape::Rows {
@@ -322,7 +432,7 @@ pub fn shape(sql: &str, dialect: Dialect) -> Result<Shape, String> {
                     alias,
                     filter,
                 },
-                None => Shape::CountOnly("its target is not a plain table".into()),
+                None => not_single_table("its target is not a plain table"),
             }
         }
         Statement::Delete(d) => {
@@ -330,22 +440,20 @@ pub fn shape(sql: &str, dialect: Dialect) -> Result<Shape, String> {
                 FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
             };
             if !d.tables.is_empty() || d.using.is_some() || from.len() != 1 {
-                return Ok(Shape::CountOnly("it names more than one table".into()));
+                return Ok(not_single_table("it names more than one table"));
             }
             if !from[0].joins.is_empty() {
-                return Ok(Shape::CountOnly("it joins other tables".into()));
+                return Ok(not_single_table("it joins other tables"));
             }
             if d.limit.is_some() || !d.order_by.is_empty() {
-                return Ok(Shape::CountOnly("ORDER BY or LIMIT picks its rows".into()));
+                return Ok(not_single_table("ORDER BY or LIMIT picks its rows"));
             }
             let filter = d.selection.as_ref().map(|e| e.to_string());
             if filter
                 .as_deref()
                 .is_some_and(|f| reads_other_tables(f, dialect))
             {
-                return Ok(Shape::CountOnly(
-                    "it reads other tables in a subquery".into(),
-                ));
+                return Ok(not_single_table("it reads other tables in a subquery"));
             }
             match single_table(&from[0]) {
                 Some((table, alias)) => Shape::Rows {
@@ -354,10 +462,10 @@ pub fn shape(sql: &str, dialect: Dialect) -> Result<Shape, String> {
                     alias,
                     filter,
                 },
-                None => Shape::CountOnly("its target is not a plain table".into()),
+                None => not_single_table("its target is not a plain table"),
             }
         }
-        Statement::Merge(_) => Shape::CountOnly("MERGE".into()),
+        Statement::Merge(_) => not_single_table("a MERGE reads a second table"),
         other => Shape::NotPreviewable(not_previewable_reason(&statement_word(other))),
     })
 }
@@ -365,17 +473,14 @@ pub fn shape(sql: &str, dialect: Dialect) -> Result<Shape, String> {
 fn not_previewable_reason(word: &str) -> String {
     match word {
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" => {
-            format!(
-                "{word} is DDL, which a rollback can't be trusted to undo (Oracle commits it \
-                 implicitly), so it is never run at propose"
-            )
+            format!("{word} is DDL: it changes the schema, not rows a read could show beforehand")
         }
-        "CALL" | "EXEC" | "EXECUTE" => format!(
-            "{word} runs a procedure, which can commit on its own, so it is never run at propose"
+        "CALL" | "EXEC" | "EXECUTE" => {
+            format!("{word} runs a procedure: what it changes can't be read beforehand")
+        }
+        _ => format!(
+            "{word} is not a single-table UPDATE or DELETE, so there are no rows to read beforehand"
         ),
-        _ => {
-            format!("{word} is not DML a rollback is known to undo, so it is never run at propose")
-        }
     }
 }
 
@@ -393,7 +498,7 @@ fn first_word(sql: &str, dialect: Dialect) -> String {
         .ok()
         .and_then(|ts| {
             ts.into_iter().find_map(|t| match t {
-                Token::Word(w) => Some(w.value.to_ascii_uppercase()),
+                SqlToken::Word(w) => Some(w.value.to_ascii_uppercase()),
                 _ => None,
             })
         })
@@ -406,7 +511,7 @@ fn reads_other_tables(text: &str, dialect: Dialect) -> bool {
         .tokenize()
         .map(|ts| {
             ts.iter()
-                .any(|t| matches!(t, Token::Word(w) if w.keyword == Keyword::SELECT && w.quote_style.is_none()))
+                .any(|t| matches!(t, SqlToken::Word(w) if w.keyword == Keyword::SELECT && w.quote_style.is_none()))
         })
         .unwrap_or(true)
 }
@@ -423,7 +528,6 @@ fn single_table(t: &TableWithJoins) -> Option<(String, Option<String>)> {
 /// The queries over a single-table write's rows, for this backend.
 pub fn row_queries(
     kind: Kind,
-    delete: bool,
     table: &str,
     alias: Option<&str>,
     filter: Option<&str>,
@@ -435,53 +539,28 @@ pub fn row_queries(
     let filter = filter.map(|f| format!(" WHERE {f}")).unwrap_or_default();
     let select = format!("SELECT * FROM {relation}{filter}");
     let qualifier = alias.unwrap_or(table);
-    match kind {
-        Kind::Sqlite => RowQueries {
-            lock: select.clone(),
-            located: (!delete).then(|| Located {
-                select: format!("SELECT rowid AS sql_review_rowid, * FROM {relation}{filter}"),
-                after_prefix: format!(
-                    "SELECT rowid AS sql_review_rowid, * FROM {table} WHERE rowid IN ("
-                ),
-            }),
-            select,
-        },
-        Kind::Oracle => RowQueries {
-            lock: format!("SELECT {qualifier}.* FROM {relation}{filter} FOR UPDATE"),
-            located: (!delete).then(|| Located {
-                select: format!(
-                    "SELECT {qualifier}.ROWID AS sql_review_rowid, {qualifier}.* FROM {relation}{filter}"
-                ),
-                after_prefix: format!(
-                    "SELECT sql_review_t.ROWID AS sql_review_rowid, sql_review_t.* \
-                     FROM {table} sql_review_t WHERE sql_review_t.ROWID IN ("
-                ),
-            }),
-            select,
-        },
-        Kind::MsSql => RowQueries {
-            lock: format!("SELECT * FROM {relation} WITH (UPDLOCK, HOLDLOCK){filter}"),
-            located: None,
-            select,
-        },
-    }
+    let lock = match kind {
+        Kind::Sqlite => select.clone(),
+        Kind::Oracle => format!("SELECT {qualifier}.* FROM {relation}{filter} FOR UPDATE"),
+        Kind::MsSql => format!("SELECT * FROM {relation} WITH (UPDLOCK, HOLDLOCK){filter}"),
+    };
+    RowQueries { select, lock }
 }
 
 fn plan(kind: Kind, statement: &str, params: Params, shape: &Shape) -> WritePlan {
     let rows = match shape {
         Shape::Rows {
-            delete,
             table,
             alias,
             filter,
+            ..
         } => Some(row_queries(
             kind,
-            *delete,
             table,
             alias.as_deref(),
             filter.as_deref(),
         )),
-        _ => None,
+        Shape::NotPreviewable(_) => None,
     };
     WritePlan {
         statement: statement.to_string(),
@@ -497,9 +576,6 @@ pub fn normalize(sql: &str) -> String {
         .trim_end_matches(|c: char| c == ';' || c.is_whitespace())
         .to_string()
 }
-
-const PREVIEW_CAVEAT: &str = "the preview ran the statement on the write account and rolled it \
-                              back: triggers fired, and sequences it advanced stay advanced";
 
 /// The write account, or why there isn't one.
 fn write_account(cfg: &Config) -> Result<crate::config::Account, String> {
@@ -518,101 +594,45 @@ fn write_account(cfg: &Config) -> Result<crate::config::Account, String> {
     })
 }
 
-/// Propose a write: preview it on the write account and roll back.
+/// Propose a write without running it. For a single-table UPDATE or
+/// DELETE, read the rows its WHERE selects on `cfg`'s read-only account;
+/// anything else is the statement alone. The write account is not used.
 pub async fn propose(cfg: &Config, sql: &str, params: &Params) -> Result<Proposal, String> {
-    let account = write_account(cfg)?;
     let statement = normalize(sql);
-    let shape = shape(&statement, cfg.backend.dialect())?;
-    let mut preview = Preview {
-        kind: PreviewKind::NotPreviewable,
-        note: None,
-        affected_query: None,
-        row_count: None,
-        rows_hash: None,
-        rows_found: None,
-        before: None,
-        after: None,
-    };
-    match &shape {
-        Shape::NotPreviewable(why) => preview.note = Some(why.clone()),
-        _ => {
-            let plan = plan(cfg.backend, &statement, params.clone(), &shape);
-            let seen = backend::preview(cfg, &account, &plan, SAMPLE_ROWS, cfg.preview_timeout)
+    let preview = match shape(&statement, cfg.backend.dialect())? {
+        Shape::NotPreviewable(why) => Preview::not_previewable(why),
+        Shape::Rows {
+            table,
+            alias,
+            filter,
+            ..
+        } => {
+            let q = row_queries(cfg.backend, &table, alias.as_deref(), filter.as_deref());
+            match backend::read_rows(cfg, &q.select, params, cfg.preview_timeout)
                 .await
-                .map_err(|e| format!("the preview failed, so nothing was proposed: {e}"))?;
-            match seen {
-                None => {
-                    preview.note = Some(format!(
-                        "the preview ran over its {} s limit (DB_PREVIEW_TIMEOUT) and was rolled \
-                         back, so it is shown as the statement alone",
-                        cfg.preview_timeout.as_secs_f64()
-                    ));
-                }
-                Some(seen) => {
-                    preview.row_count = Some(seen.count);
-                    let mut notes = Vec::new();
-                    match &shape {
-                        Shape::Rows { delete, .. } => {
-                            let before = seen.before.unwrap_or_default();
-                            preview.kind = PreviewKind::Rows;
-                            preview.affected_query = plan.rows.as_ref().map(|r| r.select.clone());
-                            preview.rows_hash = Some(before.content_hash());
-                            preview.rows_found = Some(before.rows.len() as u64);
-                            preview.before = Some(Sample::of(&before, SAMPLE_ROWS));
-                            preview.after = seen.after.map(|a| Sample::of(&a, SAMPLE_ROWS));
-                            if before.rows.len() as u64 != seen.count {
-                                notes.push(format!(
-                                    "the statement reported {} row(s); its WHERE selects {}",
-                                    seen.count,
-                                    before.rows.len()
-                                ));
-                            }
-                            if !delete && preview.after.is_none() && !before.rows.is_empty() {
-                                notes.push(
-                                    "no after sample: this backend has no row locator to find \
-                                     the rows again"
-                                        .into(),
-                                );
-                            }
-                        }
-                        Shape::Insert => {
-                            preview.kind = PreviewKind::Insert;
-                            notes.push(
-                                "an INSERT has no prior rows: apply checks the row count".into(),
-                            );
-                        }
-                        Shape::CountOnly(why) => {
-                            preview.kind = PreviewKind::CountOnly;
-                            notes.push(format!(
-                                "row count only ({why}): apply checks the count, not the rows"
-                            ));
-                        }
-                        Shape::NotPreviewable(_) => unreachable!("not previewed"),
-                    }
-                    notes.push(PREVIEW_CAVEAT.into());
-                    preview.note = Some(notes.join("; "));
-                }
+                .map_err(|e| {
+                    format!(
+                        "could not read the rows it would change on the read-only account, so \
+                         nothing was proposed: {e}"
+                    )
+                })? {
+                None => Preview::not_previewable(format!(
+                    "reading the rows it would change ran over its {} s limit \
+                     (DB_PREVIEW_TIMEOUT)",
+                    cfg.preview_timeout.as_secs_f64()
+                )),
+                Some(rows) => Preview {
+                    kind: PreviewKind::Rows,
+                    note: None,
+                    affected_query: Some(q.select),
+                    row_count: Some(rows.rows.len() as u64),
+                    rows_hash: Some(rows.content_hash()),
+                    sample: Some(Sample::of(&rows, SAMPLE_ROWS)),
+                },
             }
         }
-    }
-    let word = first_word(&statement, cfg.backend.dialect()).to_ascii_lowercase();
-    let mut p = Proposal {
-        sql_review: FORMAT,
-        id: format!("{}-{word}", uuid::Uuid::now_v7()),
-        created: now(),
-        backend: cfg.backend.name().into(),
-        profile: cfg.profile.clone(),
-        target: cfg.target(),
-        statement,
-        params: params
-            .iter()
-            .map(|(k, v)| (k.clone(), v.to_json()))
-            .collect(),
-        preview,
-        outcome: None,
     };
-    p.id.retain(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    Ok(p)
+    Ok(Proposal::new(cfg, statement, params, preview))
 }
 
 /// Apply a proposal on `cfg`'s write account. Commits only if its rows and
@@ -652,10 +672,6 @@ pub async fn apply(p: &Proposal, cfg: &Config) -> Result<u64, ApplyError> {
             count: p.preview.row_count,
             hash: p.preview.rows_hash.clone(),
         },
-        PreviewKind::Insert | PreviewKind::CountOnly => Expected {
-            count: p.preview.row_count,
-            hash: None,
-        },
         PreviewKind::NotPreviewable => Expected::default(),
     };
     backend::apply(cfg, &account, &plan, &expect)
@@ -689,38 +705,85 @@ pub fn render(p: &Proposal) -> String {
     let pv = &p.preview;
     match pv.kind {
         PreviewKind::NotPreviewable => {
-            s.push_str("not previewable: applying runs the statement as written, and nothing checks what it changes\n");
+            s.push_str(&format!(
+                "not previewable: {}\napplying runs the statement as written, and nothing checks \
+                 what it changes\n",
+                pv.note.as_deref().unwrap_or("no rows to read beforehand")
+            ));
         }
-        _ => {
+        PreviewKind::Rows => {
             let n = pv.row_count.unwrap_or_default();
             s.push_str(&format!("{n} row(s) would change"));
             if let Some(h) = &pv.rows_hash {
                 s.push_str(&format!(" (rows hash {})", &h[..h.len().min(12)]));
             }
-            s.push('\n');
+            s.push_str("; apply refuses if they move first\n");
+            if let Some(sample) = &pv.sample {
+                s.push_str(&format!("\nrows now{}:\n", shown_of(sample, n)));
+                s.push_str(&render_rows(&sample.result_set(), Format::Table));
+                s.push('\n');
+            }
         }
-    }
-    let table = |label: &str, sample: &Sample, total: Option<u64>, s: &mut String| {
-        let shown = sample.rows.len() as u64;
-        let more = match total {
-            Some(t) if t > shown => format!(" (first {shown} of {t})"),
-            _ => String::new(),
-        };
-        s.push_str(&format!("\n{label}{more}:\n"));
-        s.push_str(&render_rows(&sample.result_set(), Format::Table));
-        s.push('\n');
-    };
-    if let Some(b) = &pv.before {
-        table("before", b, pv.rows_found, &mut s);
-    }
-    if let Some(a) = &pv.after {
-        table("after", a, None, &mut s);
-    }
-    if let Some(note) = &pv.note {
-        s.push_str(&format!("\nnote: {note}\n"));
     }
     if let Some(o) = &p.outcome {
         s.push_str(&format!("\n{}", describe(p, o)));
+    }
+    s
+}
+
+/// " (first 20 of 30)" when the sample is not every row.
+fn shown_of(sample: &Sample, total: u64) -> String {
+    let shown = sample.rows.len() as u64;
+    if total > shown {
+        format!(" (first {shown} of {total})")
+    } else {
+        String::new()
+    }
+}
+
+/// A proposal as Markdown, for an approval card: the statement, then the
+/// rows and their count, or why it is not previewable.
+pub fn render_markdown(p: &Proposal) -> String {
+    let longest = p
+        .statement
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let mut s = format!("{fence}sql\n{}\n{fence}\n", p.statement);
+    if !p.params.is_empty() {
+        let params: Vec<String> = p
+            .params
+            .iter()
+            .map(|(k, v)| format!("`:{k}` = `{v}`"))
+            .collect();
+        s.push_str(&format!("\nWith {}.\n", params.join(", ")));
+    }
+    let pv = &p.preview;
+    match pv.kind {
+        PreviewKind::NotPreviewable => {
+            s.push_str(&format!(
+                "\n**Not previewable:** {}. Approving runs the statement as written, and nothing \
+                 checks what it changes.\n",
+                pv.note
+                    .as_deref()
+                    .unwrap_or("there are no rows to read beforehand")
+            ));
+        }
+        PreviewKind::Rows => {
+            let n = pv.row_count.unwrap_or_default();
+            s.push_str(&format!(
+                "\n**{n} row(s) would change.** They are shown as they are now, read on the \
+                 read-only account; the statement has not run. It is refused as stale if they \
+                 change before it commits.\n"
+            ));
+            if let Some(sample) = pv.sample.as_ref().filter(|x| !x.rows.is_empty()) {
+                s.push_str(&format!("\nRows now{}:\n\n", shown_of(sample, n)));
+                s.push_str(&render_rows(&sample.result_set(), Format::Markdown));
+                s.push('\n');
+            }
+        }
     }
     s
 }
@@ -777,45 +840,133 @@ mod tests {
     }
 
     #[test]
-    fn other_writes_are_counted_or_not_previewable() {
-        assert_eq!(
-            sh("INSERT INTO apps VALUES (4, 'd', 1, 'x')"),
-            Shape::Insert
-        );
-        assert!(matches!(
-            sh("UPDATE apps SET score = 1 WHERE app_id IN (SELECT app_id FROM other)"),
-            Shape::CountOnly(_)
-        ));
-        assert!(matches!(
-            sh("UPDATE apps SET score = (SELECT max(score) FROM other)"),
-            Shape::CountOnly(_)
-        ));
-        assert!(matches!(
-            shape(
+    fn everything_else_is_not_previewable_with_a_reason() {
+        let why = |sql: &str, d: Dialect| match shape(sql, d).unwrap() {
+            Shape::NotPreviewable(why) => why,
+            other => panic!("{sql}: {other:?}"),
+        };
+        let s = Dialect::Sqlite;
+        assert!(why("INSERT INTO apps VALUES (4, 'd', 1, 'x')", s).contains("INSERT"));
+        for (sql, d, says) in [
+            (
+                "UPDATE apps SET score = 1 WHERE app_id IN (SELECT app_id FROM other)",
+                s,
+                "subquery",
+            ),
+            (
+                "UPDATE apps SET score = (SELECT max(score) FROM other)",
+                s,
+                "subquery",
+            ),
+            (
                 "UPDATE a SET a.x = b.x FROM apps a JOIN other b ON a.id = b.id",
-                Dialect::MsSql
-            )
-            .unwrap(),
-            Shape::CountOnly(_)
-        ));
+                Dialect::MsSql,
+                "joins",
+            ),
+            (
+                "MERGE INTO apps a USING other b ON (a.id = b.id) \
+                 WHEN MATCHED THEN UPDATE SET a.x = b.x",
+                Dialect::Oracle,
+                "MERGE",
+            ),
+            ("EXEC dbo.do_things", Dialect::MsSql, "procedure"),
+            ("BEGIN do_things; END;", Dialect::Oracle, "beforehand"),
+        ] {
+            let why = why(sql, d);
+            assert!(why.contains(says), "{sql}: {why}");
+        }
         for ddl in [
             "ALTER TABLE apps ADD COLUMN x INTEGER",
             "DROP TABLE apps",
             "CREATE TABLE t (a INTEGER)",
         ] {
-            let Shape::NotPreviewable(why) = sh(ddl) else {
-                panic!("{ddl}")
-            };
-            assert!(why.contains("DDL"), "{why}");
+            assert!(why(ddl, s).contains("DDL"), "{ddl}");
         }
-        assert!(matches!(
-            shape("EXEC dbo.do_things", Dialect::MsSql).unwrap(),
-            Shape::NotPreviewable(_)
-        ));
-        assert!(matches!(
-            shape("BEGIN do_things; END;", Dialect::Oracle).unwrap(),
-            Shape::NotPreviewable(_)
-        ));
+    }
+
+    #[test]
+    fn tokens_round_trip_and_refuse_anything_else() {
+        let t = Token {
+            count: 2,
+            rows_hash: "ab".repeat(32),
+        };
+        let wire = t.to_string();
+        assert_eq!(
+            wire,
+            format!("{{\"count\":2,\"rows_hash\":\"{}\"}}", "ab".repeat(32))
+        );
+        assert_eq!(
+            crate::contract::canonical(&serde_json::from_str(&wire).unwrap()).unwrap(),
+            wire
+        );
+        assert_eq!(wire.parse::<Token>().unwrap(), t);
+        for bad in [
+            "",
+            "nope",
+            "{\"count\":2}",
+            "{\"count\":-1,\"rows_hash\":\"ab\"}",
+            &format!("{{\"count\":2,\"rows_hash\":\"{}\"}}", "AB".repeat(32)),
+            &format!(
+                "{{\"count\":2,\"rows_hash\":\"{}\",\"x\":1}}",
+                "ab".repeat(32)
+            ),
+            "{\"WRK-1\":\"2026-11-16T09:12:33.000+0000\"}",
+        ] {
+            assert!(bad.parse::<Token>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn markdown_fences_the_statement_and_shows_the_rows() {
+        let cfg = crate::config::resolve(
+            &crate::config::CredentialSource(
+                [("DB_BACKEND".to_string(), "sqlite".to_string())].into(),
+            ),
+            crate::config::Resolve::default(),
+        )
+        .unwrap();
+        let rows = ResultSet {
+            columns: vec!["id".into(), "note".into()],
+            rows: (0..25)
+                .map(|i| vec![Cell::Int(i), Cell::Text("a|b".into())])
+                .collect(),
+            truncated: false,
+        };
+        let p = Proposal::new(
+            &cfg,
+            "UPDATE t SET note = '```' WHERE id < :n".into(),
+            &[("n".to_string(), Param::Int(25))].into(),
+            Preview {
+                kind: PreviewKind::Rows,
+                note: None,
+                affected_query: None,
+                row_count: Some(25),
+                rows_hash: Some(rows.content_hash()),
+                sample: Some(Sample::of(&rows, SAMPLE_ROWS)),
+            },
+        );
+        let md = render_markdown(&p);
+        assert!(md.starts_with("````sql\nUPDATE t"), "{md}");
+        assert!(md.contains("`:n` = `25`"), "{md}");
+        assert!(md.contains("**25 row(s) would change.**"), "{md}");
+        assert!(md.contains("(first 20 of 25)"), "{md}");
+        assert!(md.contains("a\\|b"), "{md}");
+        assert_eq!(
+            p.title(),
+            "UPDATE t SET note = '```' WHERE id < :n (25 row(s))"
+        );
+        assert!(p.token().unwrap().parse::<Token>().is_ok());
+
+        let p = Proposal::new(
+            &cfg,
+            "DROP TABLE t".into(),
+            &Params::new(),
+            Preview::not_previewable("DROP is DDL"),
+        );
+        let md = render_markdown(&p);
+        assert!(md.contains("**Not previewable:** DROP is DDL."), "{md}");
+        assert_eq!(p.token(), None);
+        assert_eq!(p.title(), "DROP TABLE t (not previewable)");
     }
 
     #[test]
@@ -834,19 +985,18 @@ mod tests {
 
     #[test]
     fn row_queries_per_backend() {
-        let q = row_queries(Kind::Oracle, false, "ps.apps", Some("a"), Some("a.x = 1"));
+        let q = row_queries(Kind::Oracle, "ps.apps", Some("a"), Some("a.x = 1"));
         assert_eq!(q.select, "SELECT * FROM ps.apps a WHERE a.x = 1");
         assert_eq!(q.lock, "SELECT a.* FROM ps.apps a WHERE a.x = 1 FOR UPDATE");
-        assert!(q.located.unwrap().select.starts_with("SELECT a.ROWID AS"));
-        let q = row_queries(Kind::MsSql, false, "dbo.apps", None, Some("x = 1"));
+        let q = row_queries(Kind::MsSql, "dbo.apps", None, Some("x = 1"));
+        assert_eq!(q.select, "SELECT * FROM dbo.apps WHERE x = 1");
         assert_eq!(
             q.lock,
             "SELECT * FROM dbo.apps WITH (UPDLOCK, HOLDLOCK) WHERE x = 1"
         );
-        assert!(q.located.is_none());
-        let q = row_queries(Kind::Sqlite, true, "apps", None, None);
+        let q = row_queries(Kind::Sqlite, "apps", None, None);
         assert_eq!(q.lock, "SELECT * FROM apps");
-        assert!(q.located.is_none());
+        assert_eq!(q.select, q.lock);
     }
 
     #[test]

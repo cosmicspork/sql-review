@@ -20,9 +20,9 @@
 //! DB_FETCH_LIMIT  default row cap                    (default: 1000)
 //! DATABASE_URL    a whole SQLAlchemy-style URL, overriding the parts above
 //! DB_TRUST_SERVER_CERTIFICATE  SQL Server: skip certificate checks (default: false)
-//! DB_WRITE_USER / DB_WRITE_PASSWORD  the write account, for proposed
-//!                 writes; never read under --read-only
-//! DB_PREVIEW_TIMEOUT  seconds a write's preview may run   (default: 10)
+//! DB_WRITE_USER / DB_WRITE_PASSWORD  the write account, used only to
+//!                 apply a proposed write; never read under --read-only
+//! DB_PREVIEW_TIMEOUT  seconds reading a write's rows may take (default: 10)
 //! ```
 
 use std::{
@@ -79,8 +79,8 @@ pub struct Config {
     pub trust_server_certificate: bool,
     /// The write account. Always `None` under `--read-only`.
     pub write: Option<Account>,
-    /// How long a write's preview may run before it is rolled back and shown
-    /// as not previewable.
+    /// How long reading the rows a write would change may take, on the
+    /// read-only account, before the proposal shows as not previewable.
     pub preview_timeout: std::time::Duration,
     pub read_only: bool,
     pub env_path: Option<PathBuf>,
