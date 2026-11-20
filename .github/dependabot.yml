@@ -18,7 +18,7 @@ updates:
     schedule:
       interval: monthly
     commit-message:
-      prefix: deps
+      prefix: chore(deps)
     groups:
       cargo:
         patterns: ["*"]
