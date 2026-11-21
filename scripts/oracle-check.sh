@@ -1,8 +1,8 @@
 #!/bin/sh
 # Check sql-review against an Oracle profile: connect, a query, typed values
-# through every format, a describe, a read-only transaction and binds. Each
-# step prints PASS or FAIL; the exit status is 0 only if all pass. Nothing is
-# written to the database.
+# through every format, a describe as TABLE and as OWNER.TABLE, a read-only
+# transaction and binds. Each step prints PASS or FAIL; the exit status is 0
+# only if all pass. Nothing is written to the database.
 #
 # usage: scripts/oracle-check.sh [--profile NAME] [--env-file PATH] [--table TABLE]
 #

@@ -70,24 +70,55 @@ impl Kind {
         }
     }
 
-    /// A data-dictionary query listing a table's columns, binding `:t`.
-    /// `DESCRIBE` itself is a client command on most backends, not SQL.
-    pub fn describe_sql(self) -> &'static str {
-        match self {
-            Kind::Oracle => {
+    /// A data-dictionary query listing a table's columns, binding `:t`,
+    /// and `:o` (the owner or schema) when `qualified`. `DESCRIBE` itself is
+    /// a client command on most backends, not SQL.
+    ///
+    /// A bare name searches every schema the account can see, so on Oracle
+    /// and SQL Server its query also selects the owner, first, to tell
+    /// same-named tables apart. SQLite resolves a bare name to one table
+    /// itself.
+    pub fn describe_sql(self, qualified: bool) -> &'static str {
+        match (self, qualified) {
+            (Kind::Oracle, true) => {
                 "SELECT column_name, data_type, data_length, data_precision, \
                  data_scale, nullable, column_id \
-                 FROM all_tab_columns WHERE table_name = UPPER(:t) ORDER BY column_id"
+                 FROM all_tab_columns WHERE owner = UPPER(:o) AND table_name = UPPER(:t) \
+                 ORDER BY column_id"
             }
-            Kind::MsSql => {
+            (Kind::Oracle, false) => {
+                "SELECT owner, column_name, data_type, data_length, data_precision, \
+                 data_scale, nullable, column_id \
+                 FROM all_tab_columns WHERE table_name = UPPER(:t) ORDER BY owner, column_id"
+            }
+            (Kind::MsSql, true) => {
                 "SELECT column_name, data_type, character_maximum_length, \
                  numeric_precision, numeric_scale, is_nullable, ordinal_position \
-                 FROM information_schema.columns WHERE table_name = :t \
+                 FROM information_schema.columns WHERE table_schema = :o AND table_name = :t \
                  ORDER BY ordinal_position"
             }
-            Kind::Sqlite => {
+            (Kind::MsSql, false) => {
+                "SELECT table_schema, column_name, data_type, character_maximum_length, \
+                 numeric_precision, numeric_scale, is_nullable, ordinal_position \
+                 FROM information_schema.columns WHERE table_name = :t \
+                 ORDER BY table_schema, ordinal_position"
+            }
+            (Kind::Sqlite, true) => {
+                r#"SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(:t, :o)"#
+            }
+            (Kind::Sqlite, false) => {
                 r#"SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(:t)"#
             }
+        }
+    }
+
+    /// The column a bare name's describe names the owner in, where it has
+    /// one.
+    pub fn describe_owner_column(self) -> Option<&'static str> {
+        match self {
+            Kind::Oracle => Some("owner"),
+            Kind::MsSql => Some("table_schema"),
+            Kind::Sqlite => None,
         }
     }
 }

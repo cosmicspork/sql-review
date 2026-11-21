@@ -62,8 +62,22 @@ async fn query_with_rewritten_params() {
 async fn describe_a_catalog_view() {
     let Some(cfg) = config() else { return };
     // information_schema lists views too, so this needs no user table.
-    let rs = run::describe(&cfg, "COLUMNS").await.unwrap();
-    assert!(!rs.rows.is_empty());
+    let bare = run::describe(&cfg, "COLUMNS").await.unwrap().result;
+    assert!(!bare.rows.is_empty());
+    assert_eq!(bare.columns[0], "table_schema");
+    // The same table qualified with the schema the bare name found.
+    let schema = bare.distinct_text("table_schema").remove(0);
+    let qualified = run::describe(&cfg, &format!("{schema}.COLUMNS"))
+        .await
+        .unwrap();
+    assert_eq!(qualified.result.columns[0], "column_name");
+    assert!(!qualified.result.rows.is_empty());
+    assert!(qualified.notice.is_none());
+    let missing = run::describe(&cfg, "no_such_schema.COLUMNS").await;
+    assert!(
+        matches!(missing, Err(run::Error::NoSuchTable(_))),
+        "{missing:?}"
+    );
 }
 
 #[tokio::test]

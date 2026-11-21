@@ -170,6 +170,16 @@ fn query_describe_and_profiles() {
     let r = s.call("describe", json!({"table": "apps"})).unwrap();
     assert_eq!(r["row_count"], 4);
     assert_eq!(r["rows"][1]["name"], "email");
+    assert!(r.get("notice").is_none());
+    let r = s.call("describe", json!({"table": "main.apps"})).unwrap();
+    assert_eq!(r["row_count"], 4);
+    let e = s
+        .call("describe", json!({"table": "main.nope"}))
+        .unwrap_err();
+    assert!(
+        e.contains("no table main.nope visible to this account"),
+        "{e}"
+    );
 }
 
 #[test]

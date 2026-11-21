@@ -97,6 +97,26 @@ impl ResultSet {
         hex::encode(h.finalize())
     }
 
+    /// The distinct values of the column named `column`, as text, in the
+    /// order they first appear. Empty when there is no such column.
+    pub fn distinct_text(&self, column: &str) -> Vec<String> {
+        let Some(i) = self
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(column))
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for row in &self.rows {
+            let v = row.get(i).and_then(Cell::text).unwrap_or_default();
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     /// The shape the MCP tools answer with:
     /// `{"columns":[…],"rows":[{…}],"row_count":n,"truncated":bool}`.
     pub fn to_tool_json(&self) -> String {

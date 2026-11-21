@@ -128,6 +128,7 @@ pub struct QueryArgs {
     #[arg(long)]
     pub file: Option<PathBuf>,
     /// List a table's columns via a read-only data-dictionary query.
+    /// TABLE or OWNER.TABLE; a bare name's rows name their owner.
     #[arg(long, value_name = "TABLE")]
     pub describe: Option<String>,
     /// Bind a :NAME placeholder. Repeatable.
@@ -190,7 +191,8 @@ pub struct CheckOracleArgs {
     /// Path to a specific .env file.
     #[arg(long)]
     pub env_file: Option<PathBuf>,
-    /// The table to describe.
+    /// The table to describe, bare and qualified: TABLE (its owner is
+    /// found) or OWNER.TABLE.
     #[arg(long, default_value = "DUAL")]
     pub table: String,
 }
@@ -285,7 +287,12 @@ async fn run_inner(
     }
 
     let result = if let Some(table) = &args.describe {
-        run::describe(&cfg, table).await
+        run::describe(&cfg, table).await.map(|d| {
+            if let Some(notice) = &d.notice {
+                let _ = writeln!(err, "note: {notice}");
+            }
+            d.result
+        })
     } else {
         let sql = resolve_sql(&args, cwd, stdin)?
             .ok_or("provide --sql, --file, --describe, or pipe SQL on stdin")?;

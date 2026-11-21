@@ -138,6 +138,40 @@ async fn describe() {
 }
 
 #[tokio::test]
+async fn describe_owner_dot_table() {
+    let f = Fixture::new();
+    let bare = f
+        .cli(&["--describe", "apps", "--quiet", "--format", "csv"])
+        .await;
+    let qualified = f
+        .cli(&["--describe", "main.apps", "--quiet", "--format", "csv"])
+        .await;
+    assert_eq!(qualified.code, 0, "{}", qualified.stderr);
+    assert_eq!(qualified.stdout, bare.stdout);
+    assert!(!qualified.stderr.contains("note:"), "{}", qualified.stderr);
+}
+
+#[tokio::test]
+async fn describe_a_missing_table_is_an_error() {
+    let f = Fixture::new();
+    for (name, want) in [
+        ("nope", "ERROR: no table nope visible to this account"),
+        (
+            "main.nope",
+            "ERROR: no table main.nope visible to this account",
+        ),
+        // SQLite has no such schema: an error, not zero rows.
+        ("other.apps", "unknown database 'other'"),
+        ("a.b.c", "\"a.b.c\" is not a table name"),
+    ] {
+        let out = f.cli(&["--describe", name, "--quiet"]).await;
+        assert_eq!(out.code, 2, "{name}: {}", out.stdout);
+        assert_eq!(out.stdout, "", "{name}");
+        assert!(out.stderr.contains(want), "{name}: {}", out.stderr);
+    }
+}
+
+#[tokio::test]
 async fn params_bind() {
     let f = Fixture::new();
     let out = f
@@ -510,7 +544,8 @@ async fn check_oracle_reports_each_step() {
         "{}",
         lines[1]
     );
-    assert_eq!(lines.len(), 7);
+    assert_eq!(lines.len(), 8);
+    assert!(out.stdout.contains("FAIL describe OWNER.TABLE: skipped"));
     assert!(
         lines[2..]
             .iter()

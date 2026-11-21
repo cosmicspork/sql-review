@@ -8,7 +8,8 @@ use crate::{
     backend::{DbError, Kind, oracle},
     cli::{CheckOracleArgs, Io},
     render::{Format, render},
-    value::{Cell, Param, Params},
+    run::TableName,
+    value::{Cell, Param, Params, ResultSet},
 };
 
 const TYPED: &str = "SELECT 1 n, 'x' s, SYSDATE d, CAST(1.5 AS NUMBER(5,2)) f, NULL z FROM DUAL";
@@ -67,7 +68,8 @@ fn steps(cfg: &crate::config::Config, table: &str) -> Vec<Step> {
                 ("connect", Err(e)),
                 ("select", skipped()),
                 ("types", skipped()),
-                ("describe", skipped()),
+                ("describe TABLE", skipped()),
+                ("describe OWNER.TABLE", skipped()),
                 ("read-only transaction", skipped()),
                 ("binds", skipped()),
             ];
@@ -100,19 +102,9 @@ fn steps(cfg: &crate::config::Config, table: &str) -> Vec<Step> {
         }),
     ));
 
-    let describe_params = Params::from([("t".to_string(), Param::Text(table.into()))]);
-    out.push((
-        "describe",
-        oracle::read_only(&conn, |c| {
-            oracle::read_on(c, Kind::Oracle.describe_sql(), &describe_params, 0)
-        })
-        .and_then(|rs| match rs.rows.len() {
-            0 => Err(DbError(format!(
-                "{table} has no columns visible to this account"
-            ))),
-            n => Ok(format!("{table}: {n} column(s)")),
-        }),
-    ));
+    let (bare, qualified) = describe_steps(&conn, table);
+    out.push(("describe TABLE", bare));
+    out.push(("describe OWNER.TABLE", qualified));
 
     out.push((
         "read-only transaction",
@@ -134,4 +126,63 @@ fn steps(cfg: &crate::config::Config, table: &str) -> Vec<Step> {
         }),
     ));
     out
+}
+
+/// Describe `table` by its bare name and qualified with its owner: the
+/// owner `--table` gave, else the first owner the bare name's rows name.
+fn describe_steps(
+    conn: &oracledb::Connection,
+    table: &str,
+) -> (Result<String, DbError>, Result<String, DbError>) {
+    let name = match TableName::parse(table) {
+        Ok(n) => n,
+        Err(e) => {
+            let e = DbError(e.to_string());
+            return (Err(e.clone()), Err(e));
+        }
+    };
+    let describe = |n: &TableName| -> Result<ResultSet, DbError> {
+        let (sql, params) = n.query(Kind::Oracle);
+        let rs = oracle::read_only(conn, |c| oracle::read_on(c, sql, &params, 0))?;
+        n.finish(Kind::Oracle, rs)
+            .map(|d| d.result)
+            .map_err(|e| DbError(e.to_string()))
+    };
+    let bare_name = TableName {
+        owner: None,
+        table: name.table.clone(),
+    };
+    let bare = describe(&bare_name);
+    let owner = name.owner.clone().or_else(|| {
+        bare.as_ref()
+            .ok()
+            .and_then(|rs| rs.distinct_text("owner").into_iter().next())
+    });
+    let qualified = match owner {
+        None => Err(DbError(format!(
+            "skipped: no owner found for {}",
+            bare_name.table
+        ))),
+        Some(owner) => {
+            let q = TableName {
+                owner: Some(owner),
+                table: name.table.clone(),
+            };
+            describe(&q).map(|rs| format!("{q}: {} column(s)", rs.rows.len()))
+        }
+    };
+    let bare = bare.and_then(|rs| {
+        let owners = rs.distinct_text("owner");
+        if owners.is_empty() {
+            return Err(DbError(format!(
+                "{bare_name}: no owner column in the result"
+            )));
+        }
+        Ok(format!(
+            "{bare_name}: {} column(s) under {}",
+            rs.rows.len(),
+            owners.join(", ")
+        ))
+    });
+    (bare, qualified)
 }

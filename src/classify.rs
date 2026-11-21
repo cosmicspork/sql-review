@@ -398,11 +398,13 @@ mod tests {
     #[test]
     fn describe_sql_is_a_read() {
         for backend in crate::backend::Kind::ALL {
-            assert_eq!(
-                classify(backend.describe_sql(), backend.dialect()),
-                Ok(Classification::Read),
-                "{backend:?}"
-            );
+            for qualified in [false, true] {
+                assert_eq!(
+                    classify(backend.describe_sql(qualified), backend.dialect()),
+                    Ok(Classification::Read),
+                    "{backend:?} qualified={qualified}"
+                );
+            }
         }
     }
 }

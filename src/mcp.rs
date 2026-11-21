@@ -241,7 +241,10 @@ impl Handler {
                     .get("table")
                     .and_then(Value::as_str)
                     .ok_or("describe needs a table")?;
-                run::describe(&cfg, table).await
+                let d = run::describe(&cfg, table)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(d.to_tool_json());
             }
             other => return Err(format!("no tool {other:?}")),
         };
@@ -687,7 +690,7 @@ pub fn definitions(profiles: Option<&[String]>) -> Vec<Value> {
                             database's data dictionary.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "table": { "type": "string", "description": "A table name, optionally schema-qualified." } },
+                "properties": { "table": { "type": "string", "description": "TABLE or OWNER.TABLE. A bare name searches every schema the account can see, and its rows then name their owner." } },
                 "required": ["table"],
             },
             "annotations": { "readOnlyHint": true },
