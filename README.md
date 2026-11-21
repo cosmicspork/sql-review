@@ -50,7 +50,7 @@ sql-review --profile qa --check
 ```
 
 - SQL comes from `--sql`, else `--file`, else piped stdin.
-- `--describe TABLE` lists a table's columns from the data dictionary, through an ordinary read (`DESCRIBE` itself is a client command on most backends).
+- `--describe TABLE` lists a table's columns from the data dictionary, through an ordinary read (`DESCRIBE` itself is a client command on most backends). `OWNER.TABLE` describes the table under that owner (Oracle), schema (SQL Server) or attached database (SQLite, e.g. `main.apps`). A bare name searches every schema the account can see; on Oracle and SQL Server its rows lead with an `owner` or `table_schema` column, and when the name is in more than one schema the result keeps every row and a note on stderr says to qualify it. A table that matches nothing is an error (`no table APP4ADM.ADM_APP_DATA visible to this account`), never an empty list. Quoted identifiers (`"MixedCase"`) are not accepted.
 - `--param NAME=VALUE` binds a `:NAME` placeholder, as text (repeatable).
 - `--limit N` caps rows (`0` = no cap); the default is `DB_FETCH_LIMIT`. When rows were left behind, stderr says `(stopped at --limit N; more rows may exist)`.
 - `--format` is `table` (default), `csv`, `tsv`, `json`, `markdown` or `md`. Binary values print as lowercase hex; NULL is `null` in tables and JSON, empty in CSV and Markdown.
@@ -86,9 +86,9 @@ Every proposal and decision is logged to `log.jsonl` in the state directory (bel
 `sql-review mcp` serves two tools to any MCP client:
 
 - `query {sql, params?, limit?, profile?}`: one read. `params` binds `:name` placeholders to strings, integers, booleans or null.
-- `describe {table, profile?}`: a table's columns.
+- `describe {table, profile?}`: a table's columns, as `--describe` takes them (`TABLE` or `OWNER.TABLE`).
 
-Each answers with JSON text: `{"columns": [...], "rows": [{...}], "row_count": n, "truncated": bool}`, rows keyed in column order. A refused write or a database error comes back as a tool error result, so an agent can correct itself.
+Each answers with JSON text: `{"columns": [...], "rows": [{...}], "row_count": n, "truncated": bool}`, rows keyed in column order. A `describe` of a bare name found in more than one schema adds `"notice"` saying so. A refused write or a database error comes back as a tool error result, so an agent can correct itself.
 
 Unless `--read-only` is given, it also serves two write tools:
 
@@ -256,7 +256,7 @@ Nothing in this repository's tests reaches an Oracle database. To verify a profi
 sql-review check-oracle --profile prd            # or scripts/oracle-check.sh --profile prd
 ```
 
-It connects, runs `SELECT 1 FROM DUAL`, runs a query of typed values through every format, describes a table (`--table`, default `DUAL`), runs a query inside `SET TRANSACTION READ ONLY` and rolls back, and binds a parameter, printing `PASS` or `FAIL` for each step. It exits 0 only if every step passes, and writes nothing.
+It connects, runs `SELECT 1 FROM DUAL`, runs a query of typed values through every format, describes a table (`--table`, default `DUAL`) by its bare name and then as `OWNER.TABLE` (the owner `--table` gives, else the first one the bare name found), runs a query inside `SET TRANSACTION READ ONLY` and rolls back, and binds a parameter, printing `PASS` or `FAIL` for each step. It exits 0 only if every step passes, and writes nothing.
 
 ## What is verified and what isn't
 
