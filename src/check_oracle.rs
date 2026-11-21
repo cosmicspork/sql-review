@@ -21,6 +21,7 @@ pub async fn run(args: CheckOracleArgs, io: Io<'_>) -> i32 {
         args.env_file.as_deref(),
         args.profile.as_deref(),
         true,
+        io.keyring.as_ref(),
     ) {
         Ok(cfg) => cfg,
         Err(e) => {

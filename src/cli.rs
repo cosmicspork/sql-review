@@ -16,6 +16,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::{
     change::{self, ApplyError, Outcome, Proposal, Status},
     config::{self, Config, EnvSource, Resolve},
+    keyring::Keyring,
     render::{Format, render},
     review,
     run::{self, Request},
@@ -60,6 +61,38 @@ pub enum Command {
     Apply(ApplyArgs),
     /// Approve or reject the proposals `mcp` is waiting on.
     Review(ReviewArgs),
+    /// Store or remove a password in the OS keyring, for the CLI and `mcp`
+    /// to read when neither the environment nor .env gives one.
+    Keyring(KeyringArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct KeyringArgs {
+    #[command(subcommand)]
+    pub action: KeyringAction,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum KeyringAction {
+    /// Store a password, read from stdin (or prompted for, unechoed, on a
+    /// terminal).
+    Set(KeyringTarget),
+    /// Remove a stored password.
+    Delete(KeyringTarget),
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct KeyringTarget {
+    /// Connection profile (e.g. qa). Default: DB_PROFILE, else `default`.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// The write account's password (DB_WRITE_PASSWORD), not the read-only
+    /// account's.
+    #[arg(long)]
+    pub write: bool,
+    /// Path to a specific .env file, read for DB_PROFILE.
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -203,6 +236,9 @@ pub struct Io<'a> {
     pub stdin: Box<dyn FnOnce() -> Option<String> + 'a>,
     pub out: &'a mut dyn Write,
     pub err: &'a mut dyn Write,
+    /// Where a password neither the environment nor `.env` gives is looked
+    /// up. `None` reads none.
+    pub keyring: Option<Keyring>,
 }
 
 /// Load settings the way consulta does: env over `.env`, profile prefixes.
@@ -212,6 +248,7 @@ pub fn load_config(
     env_file: Option<&Path>,
     profile: Option<&str>,
     read_only: bool,
+    keyring: Option<&Keyring>,
 ) -> Result<Config, config::ConfigError> {
     let src = EnvSource::load(env, env_file, cwd)?;
     config::resolve(
@@ -221,6 +258,7 @@ pub fn load_config(
             prefixed: true,
             read_only,
             env_path: src.path.clone(),
+            keyring,
         },
     )
 }
@@ -233,8 +271,9 @@ pub async fn run(args: QueryArgs, io: Io<'_>) -> i32 {
         stdin,
         out,
         err,
+        keyring,
     } = io;
-    match run_inner(args, env, &cwd, stdin, out, err).await {
+    match run_inner(args, env, &cwd, stdin, out, err, keyring.as_ref()).await {
         Ok(()) => 0,
         Err(e) => {
             let _ = writeln!(err, "ERROR: {e}");
@@ -250,6 +289,7 @@ async fn run_inner(
     stdin: Box<dyn FnOnce() -> Option<String> + '_>,
     out: &mut dyn Write,
     err: &mut dyn Write,
+    keyring: Option<&Keyring>,
 ) -> Result<(), String> {
     let cfg = load_config(
         env,
@@ -257,6 +297,7 @@ async fn run_inner(
         args.env_file.as_deref(),
         args.profile.as_deref(),
         args.read_only,
+        keyring,
     )
     .map_err(|e| e.to_string())?;
 
@@ -349,8 +390,14 @@ pub async fn run_write(command: Command, io: Io<'_>, input: &mut dyn BufRead) ->
         stdin,
         out,
         err,
+        keyring,
     } = io;
-    match write_inner(command, &env, &cwd, stdin, input, out, err).await {
+    let settings = Settings {
+        env: &env,
+        cwd: &cwd,
+        keyring: keyring.as_ref(),
+    };
+    match write_inner(command, settings, stdin, input, out, err).await {
         Ok(code) => code,
         Err((code, e)) => {
             let _ = writeln!(err, "ERROR: {e}");
@@ -374,21 +421,28 @@ fn outcome_code(p: &Proposal) -> i32 {
     }
 }
 
+/// Where a write command's settings come from.
+struct Settings<'a> {
+    env: &'a BTreeMap<String, String>,
+    cwd: &'a Path,
+    keyring: Option<&'a Keyring>,
+}
+
 async fn write_inner(
     command: Command,
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
+    settings: Settings<'_>,
     stdin: Box<dyn FnOnce() -> Option<String> + '_>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, Failed> {
+    let Settings { env, cwd, keyring } = settings;
     let store = || {
         store::default_root(env)
             .and_then(Store::open)
             .map_err(failed)
     };
-    let config_for = |env_file| config_for(env, cwd, env_file);
+    let config_for = |env_file| config_for(env, cwd, env_file, keyring);
     match command {
         Command::Propose(args) => {
             let cfg = load_config(
@@ -397,6 +451,7 @@ async fn write_inner(
                 args.env_file.as_deref(),
                 args.profile.as_deref(),
                 false,
+                keyring,
             )
             .map_err(failed)?;
             let query = QueryArgs {
@@ -485,9 +540,10 @@ fn config_for<'a>(
     env: &'a BTreeMap<String, String>,
     cwd: &'a Path,
     env_file: Option<&'a Path>,
+    keyring: Option<&'a Keyring>,
 ) -> impl Fn(Option<&str>) -> Result<Config, String> + 'a {
     move |profile| {
-        load_config(env.clone(), cwd, env_file, profile, false).map_err(|e| e.to_string())
+        load_config(env.clone(), cwd, env_file, profile, false, keyring).map_err(|e| e.to_string())
     }
 }
 
@@ -521,6 +577,66 @@ pub fn parse_params(raw: &[String]) -> Result<Params, String> {
             Ok((name.trim().to_string(), Param::Text(value.to_string())))
         })
         .collect()
+}
+
+/// Run `keyring set` or `keyring delete`. Returns the exit code.
+pub fn run_keyring(args: KeyringArgs, io: Io<'_>) -> i32 {
+    let Io {
+        env,
+        cwd,
+        stdin,
+        err,
+        keyring,
+        ..
+    } = io;
+    let result = (|| {
+        let keyring = keyring.ok_or("no keyring to use")?;
+        let target = match &args.action {
+            KeyringAction::Set(t) | KeyringAction::Delete(t) => t,
+        };
+        // The profile a query run here would use, so `set` stores what it
+        // reads.
+        let profile = match &target.profile {
+            Some(p) => Some(p.clone()),
+            None => {
+                use config::Source as _;
+                EnvSource::load(env, target.env_file.as_deref(), &cwd)
+                    .map_err(|e| e.to_string())?
+                    .get("DB_PROFILE")
+            }
+        };
+        let account = crate::keyring::account(profile.as_deref(), target.write);
+        let entry = format!("{}/{account}", crate::keyring::SERVICE);
+        match &args.action {
+            KeyringAction::Set(_) => {
+                let raw = stdin().ok_or("no password given: pipe it on stdin")?;
+                let secret = raw
+                    .strip_suffix('\n')
+                    .map(|s| s.strip_suffix('\r').unwrap_or(s))
+                    .unwrap_or(&raw);
+                if secret.is_empty() {
+                    return Err("no password given: stdin was empty".to_string());
+                }
+                keyring.set(&account, secret)?;
+                let _ = writeln!(err, "stored {entry} in the OS keyring");
+            }
+            KeyringAction::Delete(_) => {
+                if keyring.delete(&account)? {
+                    let _ = writeln!(err, "removed {entry} from the OS keyring");
+                } else {
+                    let _ = writeln!(err, "nothing stored for {entry}");
+                }
+            }
+        }
+        Ok::<_, String>(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            let _ = writeln!(err, "ERROR: {e}");
+            2
+        }
+    }
 }
 
 #[cfg(test)]

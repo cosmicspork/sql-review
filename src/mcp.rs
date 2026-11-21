@@ -33,6 +33,7 @@ use crate::{
     change::{self, ApplyError, Outcome, Preview, Proposal, Shape, Token},
     config::{self, Account, CredentialSource, DEFAULT_PROFILE, EnvSource, Resolve},
     contract::{Caller, Verifier},
+    keyring::Keyring,
     run::{self, Request},
     store::{Place, Store},
     value::{Param, Params},
@@ -90,6 +91,10 @@ pub struct Standalone {
     /// Where proposed writes wait for review. `None` under `--read-only`,
     /// which offers no write tools.
     pub store: Option<Store>,
+    /// Where a password the environment and `.env` leave unset is looked
+    /// up. Only standalone has one: a plugin call's credentials are lent
+    /// with it, and nothing else is consulted.
+    pub keyring: Option<Keyring>,
 }
 
 #[derive(Clone)]
@@ -139,6 +144,7 @@ impl Handler {
                         prefixed: true,
                         read_only: s.read_only,
                         env_path: src.path.clone(),
+                        keyring: s.keyring.as_ref(),
                     },
                 )
                 .map_err(|e| e.to_string())
@@ -168,6 +174,7 @@ impl Handler {
                         prefixed: false,
                         read_only: true,
                         env_path: None,
+                        keyring: None,
                     },
                 )
                 .map_err(|e| e.to_string())
@@ -458,6 +465,7 @@ pub fn write_account_lent(
                 prefixed: false,
                 read_only: true,
                 env_path: None,
+                keyring: None,
             },
         )
         .map_err(|e| format!("credential {name}: {e}"))?;
@@ -951,5 +959,62 @@ mod tests {
                 .get("enum")
                 .is_none()
         );
+    }
+
+    /// The same database, unlent password and stored keyring entry, seen by
+    /// both modes: standalone reads the entry, a plugin call never does.
+    #[cfg(feature = "keyring")]
+    #[test]
+    fn only_standalone_reads_the_keyring() {
+        let keyring = Keyring::mock();
+        keyring.set("default", "from-keyring").unwrap();
+        keyring.set("default-write", "write-from-keyring").unwrap();
+        let fields: BTreeMap<String, String> = [
+            ("DB_BACKEND", "oracle"),
+            ("DB_HOST", "h"),
+            ("DB_SERVICE", "s"),
+            ("DB_USER", "reader"),
+            ("DB_WRITE_USER", "writer"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let dir = tempfile::tempdir().unwrap();
+
+        let standalone = Handler::new(Mode::Standalone(Standalone {
+            env: fields.clone(),
+            cwd: dir.path().to_path_buf(),
+            env_file: None,
+            read_only: false,
+            profiles: vec![DEFAULT_PROFILE.into()],
+            store: None,
+            keyring: Some(keyring.clone()),
+        }));
+        let cfg = standalone.config_for(None, &BTreeMap::new()).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("from-keyring"));
+        assert_eq!(
+            cfg.write.unwrap().password.as_deref(),
+            Some("write-from-keyring")
+        );
+
+        let plugin = Handler::new(Mode::Plugin(Arc::new(Plugin {
+            verifier: crate::contract::Verifier::new(
+                crate::PLUGIN_NAME,
+                String::new(),
+                ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                vec![],
+            ),
+            store: None,
+        })));
+        let lent = BTreeMap::from([(READ_CREDENTIAL.to_string(), fields.clone())]);
+        let cfg = plugin.config_for(None, &lent).unwrap();
+        assert_eq!(cfg.password, None);
+        assert_eq!(cfg.write, None);
+        let lent_write = BTreeMap::from([
+            (READ_CREDENTIAL.to_string(), fields.clone()),
+            (WRITE_CREDENTIAL.to_string(), fields),
+        ]);
+        let account = write_account_lent(&cfg, &lent_write).unwrap();
+        assert_eq!(account.password, None);
     }
 }

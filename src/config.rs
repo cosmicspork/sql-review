@@ -1,7 +1,8 @@
 //! Connection settings: consulta's `.env` resolution, carried over unchanged.
 //!
 //! Standalone, every value comes from the process environment or a `.env`
-//! file, and an exported variable wins over the file. With a profile (from
+//! file, and an exported variable wins over the file; a password both leave
+//! unset is looked up in the OS keyring ([`crate::keyring`]). With a profile (from
 //! `--profile`, else `DB_PROFILE`), a `<PROFILE>_`-prefixed key such as
 //! `QA_DB_HOST` is tried before the bare `DB_HOST`, so one file can hold
 //! several databases. Under Tracon the same keys arrive per call in a lent
@@ -31,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::backend::Kind;
+use crate::{backend::Kind, keyring::Keyring};
 
 pub const DEFAULT_FETCH_LIMIT: u64 = 1000;
 
@@ -289,6 +290,9 @@ pub struct Resolve<'a> {
     /// Never read the write account.
     pub read_only: bool,
     pub env_path: Option<PathBuf>,
+    /// Where a password the source leaves unset is looked up: the OS
+    /// keyring, standalone. Always `None` for a lent credential.
+    pub keyring: Option<&'a Keyring>,
 }
 
 pub fn resolve(source: &dyn Source, how: Resolve<'_>) -> Result<Config, ConfigError> {
@@ -366,7 +370,10 @@ pub fn resolve(source: &dyn Source, how: Resolve<'_>) -> Result<Config, ConfigEr
             port = p.port.or(backend.default_port());
             database = p.database;
             user = p.user;
-            password = p.password;
+            password = match p.password {
+                Some(p) => Some(p),
+                None => from_keyring(how.keyring, backend, profile.as_deref(), false)?,
+            };
             url
         }
         None => {
@@ -388,6 +395,9 @@ pub fn resolve(source: &dyn Source, how: Resolve<'_>) -> Result<Config, ConfigEr
                     ));
                 }
             }
+            if password.is_none() {
+                password = from_keyring(how.keyring, backend, profile.as_deref(), false)?;
+            }
             render_url(
                 backend,
                 host.as_deref(),
@@ -406,10 +416,16 @@ pub fn resolve(source: &dyn Source, how: Resolve<'_>) -> Result<Config, ConfigEr
     let write = if how.read_only {
         None
     } else {
-        get("DB_WRITE_USER").map(|user| Account {
-            user,
-            password: get("DB_WRITE_PASSWORD"),
-        })
+        match get("DB_WRITE_USER") {
+            None => None,
+            Some(user) => Some(Account {
+                user,
+                password: match get("DB_WRITE_PASSWORD") {
+                    Some(p) => Some(p),
+                    None => from_keyring(how.keyring, backend, profile.as_deref(), true)?,
+                },
+            }),
+        }
     };
 
     Ok(Config {
@@ -428,6 +444,29 @@ pub fn resolve(source: &dyn Source, how: Resolve<'_>) -> Result<Config, ConfigEr
         env_path: how.env_path,
         profile,
     })
+}
+
+/// A password the source left unset, from the keyring when there is one.
+/// SQLite has no logins, so it never asks.
+fn from_keyring(
+    keyring: Option<&Keyring>,
+    backend: Kind,
+    profile: Option<&str>,
+    write: bool,
+) -> Result<Option<String>, ConfigError> {
+    match keyring {
+        Some(k) if backend != Kind::Sqlite => k
+            .get(&crate::keyring::account(profile, write))
+            .map_err(|e| {
+                let key = if write {
+                    "DB_WRITE_PASSWORD"
+                } else {
+                    "DB_PASSWORD"
+                };
+                ConfigError(format!("{e}; set {key} instead"))
+            }),
+        _ => Ok(None),
+    }
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -594,6 +633,7 @@ mod tests {
                 prefixed: true,
                 read_only: false,
                 env_path: src.path.clone(),
+                keyring: None,
             },
         )
     }
@@ -850,6 +890,7 @@ mod tests {
                 prefixed: false,
                 read_only: true,
                 env_path: None,
+                keyring: None,
             },
         )
         .unwrap();
@@ -867,5 +908,120 @@ mod tests {
             "DB_BACKEND=mssql\nDB_HOST=h\nDB_USER=u\nDB_TRUST_SERVER_CERTIFICATE=maybe\n",
         );
         assert!(load(&src, None).is_err());
+    }
+
+    fn load_keyring(
+        src: &EnvSource,
+        profile: Option<&str>,
+        read_only: bool,
+        keyring: &Keyring,
+    ) -> Result<Config, ConfigError> {
+        resolve(
+            src,
+            Resolve {
+                profile,
+                prefixed: true,
+                read_only,
+                env_path: src.path.clone(),
+                keyring: Some(keyring),
+            },
+        )
+    }
+
+    /// A keyring that fails if it is ever opened.
+    fn untouchable() -> Keyring {
+        Keyring::with(|| Err("the keyring was consulted".into()))
+    }
+
+    const ORACLE: &str = "DB_BACKEND=oracle\nDB_HOST=h\nDB_SERVICE=s\nDB_USER=reader\n\
+                          QA_DB_HOST=qh\nQA_DB_USER=qareader\n";
+
+    #[cfg(feature = "keyring")]
+    #[test]
+    fn a_missing_password_comes_from_the_keyring() {
+        let k = Keyring::mock();
+        k.set("default", "kr-default").unwrap();
+        k.set("qa", "kr-qa").unwrap();
+        let (_d, src) = file_source(ORACLE);
+        let cfg = load_keyring(&src, None, false, &k).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("kr-default"));
+        // The header shows a password is there, never what it is.
+        assert_eq!(
+            cfg.redacted_url(),
+            "oracle+oracledb://reader:***@h:1521/?service_name=s"
+        );
+        let cfg = load_keyring(&src, Some("qa"), false, &k).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("kr-qa"));
+        // A profile named by DB_PROFILE picks its entry the same way.
+        let (_d, src) = file_source(&format!("{ORACLE}DB_PROFILE=QA\n"));
+        let cfg = load_keyring(&src, None, false, &k).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("kr-qa"));
+        // Nothing stored is no password, as before.
+        let (_d, src) = file_source(&ORACLE.replace("QA_", "TST_"));
+        let cfg = load_keyring(&src, Some("tst"), false, &k).unwrap();
+        assert_eq!(cfg.password, None);
+    }
+
+    #[cfg(feature = "keyring")]
+    #[test]
+    fn a_database_url_without_a_password_uses_the_keyring() {
+        let k = Keyring::mock();
+        k.set("default", "kr").unwrap();
+        let (_d, src) = file_source("DATABASE_URL=mssql://reader@h:1433/db\n");
+        let cfg = load_keyring(&src, None, false, &k).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("kr"));
+        let (_d, src) = file_source("DATABASE_URL=mssql://reader:given@h:1433/db\n");
+        let cfg = load_keyring(&src, None, false, &k).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("given"));
+    }
+
+    #[cfg(feature = "keyring")]
+    #[test]
+    fn the_write_password_comes_from_its_own_entry() {
+        let k = Keyring::mock();
+        k.set("qa", "read-pw").unwrap();
+        k.set("qa-write", "write-pw").unwrap();
+        let (_d, src) = file_source(&format!("{ORACLE}QA_DB_WRITE_USER=qawriter\n"));
+        let cfg = load_keyring(&src, Some("qa"), false, &k).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("read-pw"));
+        let w = cfg.write.unwrap();
+        assert_eq!(w.user, "qawriter");
+        assert_eq!(w.password.as_deref(), Some("write-pw"));
+    }
+
+    #[test]
+    fn the_keyring_is_not_consulted_when_it_need_not_be() {
+        let k = untouchable();
+        // A password in the environment or .env wins.
+        let (_d, src) = file_source_with_env(
+            &format!("{ORACLE}DB_WRITE_USER=w\nDB_WRITE_PASSWORD=wp\n"),
+            &[("DB_PASSWORD", "from-env")],
+        );
+        let cfg = load_keyring(&src, None, false, &k).unwrap();
+        assert_eq!(cfg.password.as_deref(), Some("from-env"));
+        assert_eq!(cfg.write.unwrap().password.as_deref(), Some("wp"));
+        // --read-only never reads the write account, keyring included.
+        let (_d, src) = file_source(&format!("{ORACLE}DB_PASSWORD=p\nDB_WRITE_USER=w\n"));
+        let cfg = load_keyring(&src, None, true, &k).unwrap();
+        assert_eq!(cfg.write, None);
+        // SQLite has no logins.
+        let (_d, src) = file_source("DB_BACKEND=sqlite\nDB_SERVICE=x.db\nDB_USER=u\n");
+        assert_eq!(load_keyring(&src, None, false, &k).unwrap().password, None);
+    }
+
+    #[test]
+    fn a_keyring_that_fails_is_an_error_naming_the_way_round() {
+        let (_d, src) = file_source(ORACLE);
+        let e = load_keyring(&src, None, false, &untouchable()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "the keyring was consulted; set DB_PASSWORD instead"
+        );
+        let (_d, src) = file_source(&format!("{ORACLE}DB_PASSWORD=p\nDB_WRITE_USER=w\n"));
+        let e = load_keyring(&src, None, false, &untouchable()).unwrap_err();
+        assert!(
+            e.to_string().ends_with("set DB_WRITE_PASSWORD instead"),
+            "{e}"
+        );
     }
 }

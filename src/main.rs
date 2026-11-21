@@ -13,12 +13,24 @@ fn piped_stdin() -> Option<String> {
     stdin.lock().read_to_string(&mut s).ok().map(|_| s)
 }
 
+/// A password typed at the terminal, unechoed.
+#[cfg(feature = "keyring")]
+fn prompt_secret() -> Option<String> {
+    rpassword::prompt_password("password (not echoed): ").ok()
+}
+
+#[cfg(not(feature = "keyring"))]
+fn prompt_secret() -> Option<String> {
+    None
+}
+
 use clap::Parser;
 use rmcp::ServiceExt;
 use sql_review::{
     check_oracle,
     cli::{self, Cli, Command, Io},
     config::EnvSource,
+    keyring::Keyring,
     mcp::{Handler, Mode, Standalone},
     serve, store,
 };
@@ -44,6 +56,7 @@ async fn main() -> ExitCode {
                     stdin: Box::new(piped_stdin),
                     out: &mut std::io::stdout(),
                     err: &mut std::io::stderr(),
+                    keyring: Some(Keyring::os()),
                 },
             )
             .await
@@ -57,6 +70,7 @@ async fn main() -> ExitCode {
                     stdin: Box::new(|| None),
                     out: &mut std::io::stdout(),
                     err: &mut std::io::stderr(),
+                    keyring: Some(Keyring::os()),
                 },
             )
             .await
@@ -75,11 +89,23 @@ async fn main() -> ExitCode {
                     stdin: Box::new(piped_stdin),
                     out: &mut std::io::stdout(),
                     err: &mut std::io::stderr(),
+                    keyring: Some(Keyring::os()),
                 },
                 &mut std::io::stdin().lock(),
             )
             .await
         }
+        Some(Command::Keyring(args)) => cli::run_keyring(
+            args,
+            Io {
+                env,
+                cwd,
+                stdin: Box::new(|| piped_stdin().or_else(prompt_secret)),
+                out: &mut std::io::stdout(),
+                err: &mut std::io::stderr(),
+                keyring: Some(Keyring::os()),
+            },
+        ),
         Some(Command::Mcp(args)) => match mcp(args, env, cwd).await {
             Ok(()) => 0,
             Err(e) => {
@@ -89,7 +115,8 @@ async fn main() -> ExitCode {
         },
         Some(Command::Serve(args)) => {
             // The plugin contract: nothing but the three start variables is
-            // read from the environment.
+            // read from the environment, and no keyring is opened: every
+            // credential arrives with its call.
             let result = match serve::Start::from_env(|k| std::env::var(k).ok()) {
                 Ok(start) => serve::serve(args, start).await,
                 Err(e) => Err(e),
@@ -148,6 +175,7 @@ async fn mcp(
         read_only: args.read_only,
         profiles,
         store,
+        keyring: Some(Keyring::os()),
     }));
     handler
         .serve(rmcp::transport::stdio())

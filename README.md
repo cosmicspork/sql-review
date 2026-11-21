@@ -112,11 +112,11 @@ A person decides in a terminal with `sql-review review`, which goes through what
 
 ### Tracon plugin
 
-Under [Tracon](https://github.com/cosmicspork/tracon), the node installs a release archive and runs `bin/sql-review serve --socket <path> --data <dir>`. It serves `query`, `describe` and `write` over MCP (streamable HTTP) on that Unix socket, with credentials lent per call by the node, never read from the environment or a `.env` file. A `write` runs only once the operator approves its card. See [The plugin contract](#the-plugin-contract) below.
+Under [Tracon](https://github.com/cosmicspork/tracon), the node installs a release archive and runs `bin/sql-review serve --socket <path> --data <dir>`. It serves `query`, `describe` and `write` over MCP (streamable HTTP) on that Unix socket, with credentials lent per call by the node, never read from the environment, a `.env` file or the OS keyring. A `write` runs only once the operator approves its card. See [The plugin contract](#the-plugin-contract) below.
 
 ## Configuration
 
-Standalone, every value comes from the process environment or a `.env` file: `--env-file PATH`, else the first `.env` found walking up from the working directory. An exported variable wins over the file, and an empty value counts as unset.
+Standalone, every value comes from the process environment or a `.env` file: `--env-file PATH`, else the first `.env` found walking up from the working directory. An exported variable wins over the file, and an empty value counts as unset. A password left unset by both can come from the OS keyring (below).
 
 | Key | Meaning |
 | --- | --- |
@@ -134,7 +134,19 @@ Standalone, every value comes from the process environment or a `.env` file: `--
 
 **Profiles.** With `--profile NAME` (or `DB_PROFILE`), a `NAME_`-prefixed key such as `QA_DB_HOST` is tried before the bare `DB_HOST`, key by key, so one `.env` holds several databases. `--profile default` means the bare keys. For `sql-review mcp`, the profiles are every prefix with a `<P>_DB_*` or `<P>_DATABASE_URL` key, lowercased, plus `default` when bare keys configure one.
 
-The OS keyring is planned as a third source and is not available yet.
+**The OS keyring.** In the CLI and `sql-review mcp`, a password that neither the environment nor `.env` gives (`DB_PASSWORD`, or a `DATABASE_URL` without one) is read from the OS keyring: service `sql-review`, account `<profile>` (`default` without a profile; the profile is `--profile`, else `DB_PROFILE`, lowercased). The write account's password, when `DB_WRITE_USER` is set and `DB_WRITE_PASSWORD` isn't, is account `<profile>-write`; under `--read-only` it is never looked up. SQLite has no logins and never asks. Nothing stored means no password, as before; a keyring that can't be read (no Secret Service running, say) is an error that names the entry and the key to set instead.
+
+```sh
+sql-review keyring set                      # prompts, unechoed; stores sql-review/default
+sql-review keyring set --profile qa --write < qa-write-password.txt
+sql-review keyring delete --profile qa
+```
+
+`keyring set` reads the password from stdin (one trailing newline is dropped), or prompts for it without echo on a terminal. Without `--profile` it uses `DB_PROFILE` from the environment or `.env`, so it stores what a query run in the same place reads. The keyring is the platform's own: the Secret Service on Linux (GNOME Keyring, KWallet; spoken to over D-Bus in pure Rust, so the static Linux build needs no system libraries), the login Keychain on macOS, and the Credential Manager on Windows. It is opened only when a password is looked up.
+
+`serve` never opens the keyring: under Tracon every credential arrives with its call, and nothing on the host is read for one.
+
+The keyring is the `keyring` Cargo feature, on by default. `cargo build --no-default-features` leaves it out (and its D-Bus dependencies with it); such a build answers `keyring set` with an error and never finds a password there.
 
 ### Moving from consulta
 
@@ -264,6 +276,7 @@ It connects, runs `SELECT 1 FROM DUAL`, runs a query of typed values through eve
 - **The contract**: verified against jira-review's test vectors (shared with Tracon's node) and the `serve` tests. The node side is being written in parallel; until it calls this build, the wire format is checked only against itself.
 - **SQL Server**: integration tests in `tests/mssql.rs` run only when `SQL_REVIEW_TEST_MSSQL_URL` points at a server; they have not been run yet. The `:name` placeholder rewrite is unit-tested. Proposed writes are written (the rows read on the read-only login at `READ COMMITTED` in a rolled-back transaction, the read's time limit by dropping the connection, then the write login, `XACT_ABORT ON` and `UPDLOCK, HOLDLOCK` at apply) and compile, but are **unverified**: no test reaches a server. The statement's row count comes from the server's done tokens, so a trigger that changes other rows may make the counts differ, and apply then refuses as stale rather than commit.
 - **Oracle**: built on Oracle's pure-Rust driver (`oracledb`, pinned to `26.0.0-beta.6`) and unit-tested where it can be (connect strings, number mapping), but **unverified against a database** until `check-oracle` is run against one. Proposed writes (the rows read on the read-only account inside `SET TRANSACTION READ ONLY` under the driver's call timeout, then the write account with autocommit off and `FOR UPDATE` at apply) compile and their queries are unit-tested. One single-table `UPDATE` was proposed, applied, refused as stale and reverted on a test database with 0.2, when propose still ran the statement; this build's propose, which never runs it, has not yet been run on Oracle. Row-level security that shows the read-only account fewer rows than the write account would make apply refuse as stale.
+- **The OS keyring**: the lookup order, profile and `-write` accounts, `--read-only`, SQLite, and `keyring set`/`delete` are tested against keyring-core's in-memory mock store, and a test shows a plugin call resolving the same unlent password to none while standalone reads it from the keyring. The Linux Secret Service store was exercised by hand (set, a query's header showing the password found, delete) with a throwaway entry, from both the glibc build and the static musl build. The macOS Keychain and Windows stores are unverified; sql-review does not build for Windows today (`serve` needs Unix sockets).
 - **Release builds**: both Linux targets have been built locally the way the release workflow builds them (`cargo zigbuild`, zig 0.15.2) and come out statically linked; the x86_64 binary was run, the aarch64 one only built. The `aarch64-apple-darwin` archive is unverified until the first tag builds it.
 
 ## Development
@@ -271,6 +284,7 @@ It connects, runs `SELECT 1 FROM DUAL`, runs a query of typed values through eve
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo test
 ```
 

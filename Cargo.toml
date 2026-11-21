@@ -6,6 +6,18 @@ edition = "2024"
 description = "Read-only SQL for people and agents: a CLI, an MCP server and a Tracon plugin"
 repository = "https://github.com/cosmicspork/sql-review"
 
+[features]
+default = ["keyring"]
+# Passwords from the OS keyring in the standalone modes. Without it the
+# binary has no keyring code at all, and `sql-review keyring` says so.
+keyring = [
+    "dep:keyring-core",
+    "dep:rpassword",
+    "dep:zbus-secret-service-keyring-store",
+    "dep:apple-native-keyring-store",
+    "dep:windows-native-keyring-store",
+]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
@@ -16,7 +28,9 @@ dotenvy = "0.15"
 ed25519-dalek = "3"
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"
+keyring-core = { version = "1.1", optional = true }
 oracledb = "=26.0.0-beta.6"
+rpassword = { version = "7.5", optional = true }
 rmcp = { version = "3.10", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 schemars = "1"
@@ -30,6 +44,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tokio-util = { version = "0.7", features = ["compat"] }
 url = "2"
 uuid = { version = "1", features = ["v7"] }
+
+# The keyring crate family's stores, one per platform. Secret Service goes
+# over zbus with Rust crypto, so the static musl build needs no libdbus or
+# OpenSSL.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { version = "1", optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
