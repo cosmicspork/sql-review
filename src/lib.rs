@@ -15,6 +15,7 @@ pub mod classify;
 pub mod cli;
 pub mod config;
 pub mod contract;
+pub mod keyring;
 pub mod mcp;
 pub mod render;
 pub mod review;

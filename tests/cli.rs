@@ -5,7 +5,10 @@ mod common;
 use std::{collections::BTreeMap, path::Path};
 
 use clap::Parser;
-use sql_review::cli::{Cli, Io, run};
+use sql_review::{
+    cli::{Cli, Command, Io, run, run_keyring, run_write},
+    keyring::Keyring,
+};
 
 struct Out {
     code: i32,
@@ -14,6 +17,17 @@ struct Out {
 }
 
 async fn cli_with(args: &[&str], env: &[(&str, &str)], cwd: &Path, stdin: Option<&str>) -> Out {
+    cli_keyring(args, env, cwd, stdin, None).await
+}
+
+/// The CLI with `keyring` standing in for the OS keyring.
+async fn cli_keyring(
+    args: &[&str],
+    env: &[(&str, &str)],
+    cwd: &Path,
+    stdin: Option<&str>,
+    keyring: Option<Keyring>,
+) -> Out {
     let parsed = Cli::try_parse_from(std::iter::once("sql-review").chain(args.iter().copied()))
         .expect("arguments parse");
     let env: BTreeMap<String, String> = env
@@ -22,17 +36,19 @@ async fn cli_with(args: &[&str], env: &[(&str, &str)], cwd: &Path, stdin: Option
         .collect();
     let stdin = stdin.map(str::to_string);
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = run(
-        parsed.query,
-        Io {
-            env,
-            cwd: cwd.to_path_buf(),
-            stdin: Box::new(move || stdin),
-            out: &mut out,
-            err: &mut err,
-        },
-    )
-    .await;
+    let io = Io {
+        env,
+        cwd: cwd.to_path_buf(),
+        stdin: Box::new(move || stdin),
+        out: &mut out,
+        err: &mut err,
+        keyring,
+    };
+    let code = match parsed.command {
+        Some(Command::Keyring(args)) => run_keyring(args, io),
+        Some(command) => run_write(command, io, &mut std::io::empty()).await,
+        None => run(parsed.query, io).await,
+    };
     Out {
         code,
         stdout: String::from_utf8(out).unwrap(),
@@ -407,6 +423,7 @@ async fn read_only_never_reads_the_write_account() {
         None,
         None,
         true,
+        None,
     )
     .unwrap();
     assert_eq!(cfg.write, None);
@@ -447,6 +464,7 @@ async fn a_write_past_the_classifier_fails_on_the_read_only_connection() {
         None,
         None,
         true,
+        None,
     )
     .unwrap();
     for sql in [
@@ -498,6 +516,7 @@ async fn check_oracle(env: &[(&str, &str)], cwd: &Path) -> Out {
             stdin: Box::new(|| None),
             out: &mut out,
             err: &mut err,
+            keyring: None,
         },
     )
     .await;
@@ -552,4 +571,94 @@ async fn check_oracle_reports_each_step() {
             .all(|l| l.ends_with("skipped: no connection"))
     );
     assert!(!out.stdout.contains("secret-pw"));
+}
+
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn keyring_set_and_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = Keyring::mock();
+    let set = |args: &'static [&'static str], env: &'static [(&str, &str)], stdin: &'static str| {
+        let (k, path) = (k.clone(), dir.path().to_path_buf());
+        async move { cli_keyring(args, env, &path, Some(stdin), Some(k)).await }
+    };
+
+    let out = set(&["keyring", "set"], &[], "pw\n").await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stderr, "stored sql-review/default in the OS keyring\n");
+    assert_eq!(out.stdout, "");
+    assert_eq!(k.get("default").unwrap().as_deref(), Some("pw"));
+
+    // One trailing newline is the terminal's, not the password's.
+    let out = set(
+        &["keyring", "set", "--profile", "QA", "--write"],
+        &[],
+        "a b \r\n",
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(k.get("qa-write").unwrap().as_deref(), Some("a b "));
+
+    // Without --profile, DB_PROFILE picks the entry, as it would for a query.
+    let out = set(&["keyring", "set"], &[("DB_PROFILE", "tst")], "t").await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(k.get("tst").unwrap().as_deref(), Some("t"));
+
+    let out = set(&["keyring", "set"], &[], "\n").await;
+    assert_eq!(out.code, 2);
+    assert!(out.stderr.contains("stdin was empty"), "{}", out.stderr);
+
+    let out = set(
+        &["keyring", "delete", "--profile", "qa", "--write"],
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        out.stderr,
+        "removed sql-review/qa-write from the OS keyring\n"
+    );
+    assert_eq!(k.get("qa-write").unwrap(), None);
+    let out = set(
+        &["keyring", "delete", "--profile", "qa", "--write"],
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.stderr, "nothing stored for sql-review/qa-write\n");
+}
+
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn a_query_reads_its_password_from_the_keyring() {
+    // Nothing listens on port 1, so the header is as far as it gets: it
+    // shows a password was found, and never the password.
+    let dir = tempfile::tempdir().unwrap();
+    let k = Keyring::mock();
+    k.set("default", "kr-secret").unwrap();
+    let env = [
+        ("DB_BACKEND", "oracle"),
+        ("DB_HOST", "127.0.0.1"),
+        ("DB_PORT", "1"),
+        ("DB_SERVICE", "FREEPDB1"),
+        ("DB_USER", "u"),
+    ];
+    let out = cli_keyring(
+        &["--sql", "SELECT 1 FROM dual"],
+        &env,
+        dir.path(),
+        None,
+        Some(k),
+    )
+    .await;
+    assert_eq!(out.code, 2);
+    assert!(
+        out.stderr
+            .contains("oracle+oracledb://u:***@127.0.0.1:1/?service_name=FREEPDB1"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("kr-secret"));
 }

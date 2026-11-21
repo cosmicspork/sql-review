@@ -78,6 +78,7 @@ impl Fixture {
             stdin: Box::new(|| None),
             out: &mut out,
             err: &mut err,
+            keyring: None,
         };
         let code = match parsed.command {
             Some(command) => run_write(command, io, &mut Cursor::new(input.as_bytes())).await,
@@ -327,7 +328,7 @@ async fn a_write_sent_through_query_fails_on_the_read_only_connection() {
     );
     // Past the classifier, straight to the read path, the read-only
     // connection refuses it, write account configured or not.
-    let cfg = load_config(f.env_map(), f.cwd(), None, None, false).unwrap();
+    let cfg = load_config(f.env_map(), f.cwd(), None, None, false, None).unwrap();
     assert!(cfg.write.is_some());
     let e = sql_review::backend::read(&cfg, "DELETE FROM apps", &Default::default(), 0)
         .await
@@ -377,7 +378,7 @@ async fn other_dml_is_not_previewable_and_runs_as_written() {
 async fn reading_the_rows_has_a_time_limit() {
     let mut f = Fixture::new();
     f.set("DB_PREVIEW_TIMEOUT", "0.3");
-    let cfg = load_config(f.env_map(), f.cwd(), None, None, false).unwrap();
+    let cfg = load_config(f.env_map(), f.cwd(), None, None, false, None).unwrap();
     let slow = "SELECT * FROM apps WHERE (WITH RECURSIVE c(n) AS \
                 (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 200000000) \
                 SELECT count(*) FROM c) > 0";
@@ -439,7 +440,7 @@ async fn a_proposal_for_another_database_is_refused() {
 /// What `sql-review mcp` does with a `write`: a pending proposal in the
 /// store, decided here as `review` would decide it.
 async fn put_pending(f: &Fixture, sql: &str) -> String {
-    let cfg = load_config(f.env_map(), f.cwd(), None, None, false).unwrap();
+    let cfg = load_config(f.env_map(), f.cwd(), None, None, false, None).unwrap();
     let p = sql_review::change::propose(&cfg, sql, &Default::default())
         .await
         .unwrap();
