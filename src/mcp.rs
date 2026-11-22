@@ -47,13 +47,16 @@ pub const PROPOSAL_STATUS: &str = "proposal_status";
 /// The longest `proposal_status` waits in one call.
 pub const MAX_WAIT_SECS: u64 = 45;
 
-/// The credential a plugin call reads with: `sql-read` for the default
-/// profile, `sql-read-<profile>` for another.
+/// The credential a plugin call reads with: `sql-read` for a call that
+/// names no profile, `sql-read-<profile>` for one that does. The manifest
+/// declares it with `select = "profile"`, so the node lends a call only that
+/// one binding.
 pub const READ_CREDENTIAL: &str = "sql-read";
 
 /// The credential an approved plugin `write` applies with: `sql-write` for
-/// the default profile, `sql-write-<profile>` for another. The node lends it
-/// only to a call dispatched from an approved card (`lend = "approved"`).
+/// a call that names no profile, `sql-write-<profile>` for one that does.
+/// The node lends it only to a call dispatched from an approved card
+/// (`lend = "approved"`), and, by `select = "profile"`, only as that binding.
 pub const WRITE_CREDENTIAL: &str = "sql-write";
 
 /// The JSON-RPC method the node sends when an approval card opens.
@@ -150,27 +153,36 @@ impl Handler {
                 .map_err(|e| e.to_string())
             }
             Mode::Plugin(_) => {
-                let lent = lent_profiles(credentials);
+                // The binding the node lends by `select = "profile"`: the
+                // one the call names, or `sql-read` when it names none,
+                // never another profile's, whatever else is lent.
                 let chosen = match profile {
-                    Some(p) if !lent.iter().any(|x| x == p) => {
+                    None => DEFAULT_PROFILE,
+                    // `sql-read` is the default; `sql-read-default` would be
+                    // another binding, which `sql-write` could not match.
+                    Some(DEFAULT_PROFILE) => {
                         return Err(format!(
-                            "credential {} was not lent to this call",
-                            credential_name(p)
+                            "profile {DEFAULT_PROFILE} names no connection here: leave profile \
+                             out to read with {READ_CREDENTIAL}"
                         ));
                     }
-                    _ if lent.is_empty() => {
+                    Some(p) => p,
+                };
+                let name = credential_name(chosen);
+                let fields = match credentials.get(&name) {
+                    Some(fields) => fields.clone(),
+                    None if profile.is_none() => {
                         return Err(format!(
                             "no {READ_CREDENTIAL} credential was lent to this call"
                         ));
                     }
-                    _ => select_profile(profile, &lent)?,
+                    None => return Err(format!("credential {name} was not lent to this call")),
                 };
-                let fields = credentials[&credential_name(&chosen)].clone();
                 // Plugin calls never read a write account.
                 config::resolve(
                     &CredentialSource(fields),
                     Resolve {
-                        profile: Some(&chosen),
+                        profile: Some(chosen),
                         prefixed: false,
                         read_only: true,
                         env_path: None,
@@ -189,11 +201,7 @@ impl Handler {
         credentials: &BTreeMap<String, BTreeMap<String, String>>,
         _caller: Option<&Caller>,
     ) -> Result<String, String> {
-        let profile = match args.get("profile") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.as_str()),
-            Some(_) => return Err("profile must be a string".into()),
-        };
+        let profile = profile_of(args)?;
         if tool == PROPOSAL_STATUS {
             let store = self.store().ok_or("this server offers no writes")?;
             return proposal_status(store, args).await.map(|v| v.to_string());
@@ -425,12 +433,18 @@ fn write_args(args: &Map<String, Value>) -> Result<(&str, Params, Option<&str>),
         .get("sql")
         .and_then(Value::as_str)
         .ok_or("write needs sql")?;
-    let profile = match args.get("profile") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.as_str()),
-        Some(_) => return Err("profile must be a string".into()),
-    };
-    Ok((sql, params_of(args)?, profile))
+    Ok((sql, params_of(args)?, profile_of(args)?))
+}
+
+/// The `profile` a call names: none when it is absent, null or empty, as
+/// the node reads it to pick the binding it lends.
+fn profile_of(args: &Map<String, Value>) -> Result<Option<&str>, String> {
+    match args.get("profile") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err("profile must be a string".into()),
+    }
 }
 
 /// The write account lent for `cfg`'s profile. Its fields are the same
@@ -618,32 +632,13 @@ pub fn plugin_write_definition() -> Value {
                 },
                 "profile": {
                     "type": "string",
-                    "description": "Which database connection to use. Default: the default profile, or the only one.",
+                    "description": PLUGIN_PROFILE,
                 },
             },
             "required": ["sql"],
         },
         "annotations": { "readOnlyHint": false, "destructiveHint": true },
     })
-}
-
-/// The profiles a call's credentials lend: `sql-read` is `default`,
-/// `sql-read-<p>` is `<p>`.
-pub fn lent_profiles(credentials: &BTreeMap<String, BTreeMap<String, String>>) -> Vec<String> {
-    let mut out: Vec<String> = credentials
-        .keys()
-        .filter_map(|n| {
-            if n == READ_CREDENTIAL {
-                Some(DEFAULT_PROFILE.to_string())
-            } else {
-                n.strip_prefix("sql-read-")
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-            }
-        })
-        .collect();
-    out.sort();
-    out
 }
 
 fn credential_name(profile: &str) -> String {
@@ -668,6 +663,11 @@ pub fn select_profile(profile: Option<&str>, profiles: &[String]) -> Result<Stri
         None => Err(format!("say which profile: {}", profiles.join(", "))),
     }
 }
+
+/// A plugin tool's `profile`: the node lends the binding it names.
+const PLUGIN_PROFILE: &str = "Which database connection to use: profile P reads with the \
+                              channel's sql-read-P credential. Leave it out for the default \
+                              connection, sql-read.";
 
 /// The tools, with `profile` an enum of `profiles` when given (standalone)
 /// or a free string (plugin: the node knows the channel's profiles).
@@ -708,7 +708,7 @@ pub fn definitions(profiles: Option<&[String]>) -> Vec<Value> {
         let schema = match profiles {
             None => json!({
                 "type": "string",
-                "description": "Which database connection to use. Default: the default profile, or the only one.",
+                "description": PLUGIN_PROFILE,
             }),
             Some([]) => continue,
             Some(ps) => json!({
@@ -915,18 +915,6 @@ mod tests {
 
     #[test]
     fn credentials_name_profiles() {
-        let creds: BTreeMap<String, BTreeMap<String, String>> = [
-            "sql-read",
-            "sql-read-qa",
-            "sql-read-",
-            "sql-write",
-            "sql-write-qa",
-            "other",
-        ]
-        .into_iter()
-        .map(|n| (n.to_string(), BTreeMap::new()))
-        .collect();
-        assert_eq!(lent_profiles(&creds), ps(&["default", "qa"]));
         assert_eq!(credential_name("default"), "sql-read");
         assert_eq!(credential_name("qa"), "sql-read-qa");
     }

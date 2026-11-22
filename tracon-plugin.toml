@@ -8,20 +8,25 @@ exec = ["bin/sql-review", "serve"]
 # declared here.
 egress = []
 
-# Read account: `sql-read` is the default profile, `sql-read-<profile>` any
-# other. Fields are the standalone DB_* keys (DB_BACKEND, DB_HOST, DB_PORT,
-# DB_SERVICE, DB_USER, DB_PASSWORD, DATABASE_URL, ...).
+# Read account. A call is lent only the binding its `profile` argument
+# names: `sql-read-<profile>`, or `sql-read` when it names none (tracon
+# 0.58's `select`; older nodes refuse the key). Fields are the standalone
+# DB_* keys (DB_BACKEND, DB_HOST, DB_PORT, DB_SERVICE, DB_USER, DB_PASSWORD,
+# DATABASE_URL, ...).
 [[credential]]
 name = "sql-read"
 pattern = "sql-read-*"
+select = "profile"
 
-# Write account, lent only to a `write` dispatched from an approved card.
-# Same DB_* fields: DB_USER/DB_PASSWORD are the write account; connection
-# fields left out are sql-read's, and any given must name the same database.
+# Write account, lent only to a `write` dispatched from an approved card,
+# and only as `sql-write-<profile>`, or `sql-write` for no profile. Same
+# DB_* fields: DB_USER/DB_PASSWORD are the write account; connection fields
+# left out are sql-read's, and any given must name the same database.
 [[credential]]
 name = "sql-write"
 pattern = "sql-write-*"
 lend = "approved"
+select = "profile"
 
 [[tool]]
 name = "query"
