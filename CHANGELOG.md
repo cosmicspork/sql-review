@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/cosmicspork/sql-review/compare/v0.3.0...v0.4.0) (2026-11-22)
+
+
+### Features
+
+* lend each call only the profile it names ([#14](https://github.com/cosmicspork/sql-review/issues/14)) ([1e51a03](https://github.com/cosmicspork/sql-review/commit/1e51a036848fb7f341255bcd4be84a4ac954893d))
+* read standalone passwords from the OS keyring ([#13](https://github.com/cosmicspork/sql-review/issues/13)) ([18b9a38](https://github.com/cosmicspork/sql-review/commit/18b9a3868b5c14dd00267cab9b3e012532f2869c))
+
+
+### Bug Fixes
+
+* describe honours OWNER.TABLE and labels a bare name's owners ([#11](https://github.com/cosmicspork/sql-review/issues/11)) ([d023922](https://github.com/cosmicspork/sql-review/commit/d0239227d5444af89890be165fd7e4c793f2647c))
+
 ## [0.3.0](https://github.com/cosmicspork/sql-review/compare/v0.2.0...v0.3.0) (2026-11-20)
 
 
