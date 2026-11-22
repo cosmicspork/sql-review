@@ -340,6 +340,74 @@ async fn tools_list_matches_the_manifest() {
     let profile = &r["result"]["tools"][0]["inputSchema"]["properties"]["profile"];
     assert_eq!(profile["type"], "string");
     assert!(profile.get("enum").is_none());
+
+    // Each credential is lent only as the binding the call's argument
+    // names, so every tool must take that argument by that name: a tool
+    // without it would only ever be lent the bare binding.
+    let credentials = manifest["credential"].as_array().unwrap();
+    assert_eq!(credentials.len(), 2);
+    for c in credentials {
+        assert_eq!(c["select"].as_str(), Some("profile"), "{c}");
+    }
+    for t in r["result"]["tools"].as_array().unwrap() {
+        assert_eq!(
+            t["inputSchema"]["properties"]["profile"]["type"], "string",
+            "{t}"
+        );
+    }
+}
+
+/// What the node lends by `select = "profile"`: one call names no profile
+/// and is lent `sql-read`, or names one and is lent `sql-read-<profile>`.
+/// sql-review reads with exactly that binding, never another lent one.
+#[tokio::test]
+async fn a_call_reads_with_the_binding_its_profile_names() {
+    let mut p = Plugin::start().await;
+    let n = |r: &Value| rows(r)["rows"][0]["n"].clone();
+    let sql = "SELECT count(*) AS n FROM apps";
+
+    // No profile, or an empty one, is the default: sql-read.
+    for args in [
+        json!({"sql": sql}),
+        json!({"sql": sql, "profile": null}),
+        json!({"sql": sql, "profile": ""}),
+    ] {
+        let ctx = p.context("query", &args, json!({"sql-read": p.read_cred(&p.db)}));
+        let r = p.call_with("query", args, Some(ctx)).await;
+        assert_eq!(n(&r), 3, "{r}");
+    }
+
+    // No profile, with only another profile's binding lent (which the node
+    // never does for such a call): no falling back to it.
+    let args = json!({"sql": sql});
+    let ctx = p.context("query", &args, json!({"sql-read-qa": p.read_cred(&p.qa)}));
+    let r = p.call_with("query", args, Some(ctx)).await;
+    assert_eq!(
+        r["result"]["content"][0]["text"], "no sql-read credential was lent to this call",
+        "{r}"
+    );
+
+    // `default` names `sql-read-default`, not `sql-read`: refused rather
+    // than read with a binding the node did not select.
+    let args = json!({"sql": sql, "profile": "default"});
+    let creds = json!({"sql-read-default": p.read_cred(&p.qa), "sql-read": p.read_cred(&p.db)});
+    let ctx = p.context("query", &args, creds);
+    let r = p.call_with("query", args, Some(ctx)).await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("leave profile out"),
+        "{r}"
+    );
+
+    // An approved write with no profile applies on sql-write.
+    let args = json!({"sql": "DELETE FROM apps WHERE app_id = 1", "profile": ""});
+    let ctx = p.approved("write", &args, p.write_creds(), &Value::Null);
+    let r = p.call_with("write", args, Some(ctx)).await;
+    assert_eq!(rows(&r)["row_count"], 1, "{r}");
+    assert_eq!(common::count(&p.db), 2);
 }
 
 #[tokio::test]
